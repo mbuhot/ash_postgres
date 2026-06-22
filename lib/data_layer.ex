@@ -292,6 +292,21 @@ defmodule AshPostgres.DataLayer do
         doc:
           "Whether or not to include this resource in the generated migrations with `mix ash.generate_migrations`"
       ],
+      temporal_period: [
+        type: :atom,
+        default: nil,
+        doc: """
+        Marks this resource as an SQL:2011 application-time temporal table by naming the
+        range-typed primary-key attribute that holds its validity period (e.g. `:valid_at`).
+
+        When set, `update` and `destroy` actions are emitted as
+        `UPDATE/DELETE ... FOR PORTION OF <period>`: PostgreSQL clips the matching rows to
+        the written period and inserts any leftover remainder. The named attribute must be
+        part of the primary key (declared `WITHOUT OVERLAPS` in the table), its storage type
+        must be a range, and the key must have at least one other (entity-identifying) member.
+        Requires PostgreSQL 18+.
+        """
+      ],
       storage_types: [
         type: :keyword_list,
         default: [],
@@ -426,7 +441,8 @@ defmodule AshPostgres.DataLayer do
       AshPostgres.Verifiers.ValidateCheckConstraints,
       AshPostgres.Verifiers.PreventAttributeMultitenancyAndNonFullMatchType,
       AshPostgres.Verifiers.EnsureTableOrPolymorphic,
-      AshPostgres.Verifiers.ValidateIdentityIndexNames
+      AshPostgres.Verifiers.ValidateIdentityIndexNames,
+      AshPostgres.Verifiers.ValidateTemporalPeriod
     ]
 
   def migrate(args) do
@@ -4088,29 +4104,20 @@ defmodule AshPostgres.DataLayer do
 
   # === SQL:2011 application-time temporal support ==========================
   #
-  # When a resource's COMPOSITE primary key includes a postgres range-typed
-  # attribute (e.g. `daterange`), that attribute names an application-time
-  # period and the rest of the key identifies the entity across its timeline.
-  # Ordinary update/destroy operations are then rewritten to
-  # `UPDATE/DELETE ... FOR PORTION OF`: PostgreSQL clips the matching rows to
-  # the period being written and DB-side inserts any leftover remainder.
+  # A resource opts in by naming its period attribute with `temporal_period` in
+  # the `postgres` block (validated by `AshPostgres.Verifiers.ValidateTemporalPeriod`:
+  # it must be a range-typed primary-key member, with at least one other key member
+  # identifying the entity across its timeline). Ordinary update/destroy operations
+  # on such a resource are rewritten to `UPDATE/DELETE ... FOR PORTION OF`: PostgreSQL
+  # clips the matching rows to the period being written and DB-side inserts any
+  # leftover remainder.
   #
   # The period bounds come from the period attribute's value on the changeset
   # (the change for updates, the record for destroys); the SET clause is the
   # other attribute changes; the WHERE clause is the rest of the primary key.
 
   defp temporal_period_attribute(resource) do
-    pkey = Ash.Resource.Info.primary_key(resource)
-
-    if length(pkey) > 1 do
-      Enum.find(pkey, &range_pkey_member?(resource, &1))
-    end
-  end
-
-  defp range_pkey_member?(resource, name) do
-    attribute = Ash.Resource.Info.attribute(resource, name)
-    storage_type = Ash.Type.storage_type(attribute.type, attribute.constraints)
-    is_atom(storage_type) and String.ends_with?(to_string(storage_type), "range")
+    AshPostgres.DataLayer.Info.temporal_period(resource)
   end
 
   defp for_portion_of_update(resource, changeset, period) do
