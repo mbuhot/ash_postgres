@@ -29,8 +29,10 @@ defmodule AshPostgres.Verifiers.ValidateTemporalPeriod do
       not range_storage_type?(attribute) ->
         error(
           dsl,
-          "attribute `#{inspect(period)}` must have a range storage type " <>
-            "(e.g. :daterange, :tstzrange), got #{inspect(storage_type(attribute))}"
+          "attribute `#{inspect(period)}` must have one of the built-in PostgreSQL range " <>
+            "storage types (:daterange, :tsrange, :tstzrange, :int4range, :int8range, " <>
+            ":numrange), got #{inspect(storage_type(attribute))} — custom and multirange " <>
+            "types are not supported as temporal periods"
         )
 
       primary_key == [period] ->
@@ -59,10 +61,7 @@ defmodule AshPostgres.Verifiers.ValidateTemporalPeriod do
   end
 
   defp range_storage_type?(attribute) do
-    case storage_type(attribute) do
-      type when is_atom(type) -> String.ends_with?(to_string(type), "range")
-      _ -> false
-    end
+    match?({:ok, _}, AshPostgres.Temporal.RangeSubtype.cast_subtype(storage_type(attribute)))
   end
 
   defp storage_type(attribute), do: Ash.Type.storage_type(attribute.type, attribute.constraints)

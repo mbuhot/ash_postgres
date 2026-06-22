@@ -125,6 +125,36 @@ defmodule AshPostgres.TemporalPeriodVerifierTest do
     assert error.message =~ "range storage type"
   end
 
+  test "rejects a period whose storage type is a multirange" do
+    error =
+      assert_dsl_error do
+        defmodule TpMultiRange do
+          use Ash.Resource,
+            domain: nil,
+            validate_domain_inclusion?: false,
+            data_layer: AshPostgres.DataLayer
+
+          postgres do
+            table("tp_multi_range")
+            repo(AshPostgres.TestRepo)
+            temporal_period(:valid_at)
+          end
+
+          attributes do
+            attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+            attribute(:valid_at, AshPostgres.Test.DateMultiRange,
+              primary_key?: true,
+              allow_nil?: false,
+              public?: true
+            )
+          end
+        end
+      end
+
+    assert error.message =~ "range storage type"
+  end
+
   test "rejects a primary key with no entity-identifying member beyond the period" do
     error =
       assert_dsl_error do

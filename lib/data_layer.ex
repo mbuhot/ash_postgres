@@ -4494,14 +4494,18 @@ defmodule AshPostgres.DataLayer do
 
   defp subtype(resource, period) do
     attribute = Ash.Resource.Info.attribute(resource, period)
+    storage_type = Ash.Type.storage_type(attribute.type, attribute.constraints)
 
-    case Ash.Type.storage_type(attribute.type, attribute.constraints) do
-      :daterange -> "date"
-      :tsrange -> "timestamp"
-      :tstzrange -> "timestamptz"
-      :int4range -> "integer"
-      :int8range -> "bigint"
-      :numrange -> "numeric"
+    case AshPostgres.Temporal.RangeSubtype.cast_subtype(storage_type) do
+      {:ok, subtype} ->
+        subtype
+
+      :error ->
+        raise ArgumentError,
+              "temporal period `#{inspect(period)}` has storage type #{inspect(storage_type)}, " <>
+                "which is not a supported range type. Only the built-in PostgreSQL range types " <>
+                "(:daterange, :tsrange, :tstzrange, :int4range, :int8range, :numrange) are " <>
+                "supported as temporal periods."
     end
   end
 
