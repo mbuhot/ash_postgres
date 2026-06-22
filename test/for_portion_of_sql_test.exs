@@ -14,6 +14,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
 
   alias AshPostgres.Test.ContractRate
   alias AshPostgres.Test.SourcedRate
+  alias AshPostgres.Test.TenantRate
   alias AshPostgres.Test.TierPrice
 
   test "an empty filter produces no IN(subquery) clause" do
@@ -143,5 +144,47 @@ defmodule AshPostgres.ForPortionOfSqlTest do
 
     refute statement =~ ~s|"valid_at"|
     refute statement =~ ~s|"code"|
+  end
+
+  test "context multitenancy schema-qualifies the update target and its IN(subquery) to the tenant schema" do
+    changeset =
+      %TenantRate{code: "pro", valid_at: {~D[2026-01-01], nil}, monthly_price: Decimal.new("30.00")}
+      |> Map.update!(:__meta__, &Map.put(&1, :state, :loaded))
+      |> Ash.Changeset.for_update(
+        :change_price,
+        %{monthly_price: Decimal.new("60.00"), valid_at: {~D[2026-06-16], nil}},
+        tenant: "acme"
+      )
+
+    {statement, _params, _columns} =
+      AshPostgres.DataLayer.build_for_portion_of_update(
+        TenantRate,
+        changeset,
+        :valid_at,
+        AshPostgres.TestRepo
+      )
+
+    assert statement =~ ~s|UPDATE "acme"."tenant_rates" FOR PORTION OF "valid_at"|
+    assert statement =~ ~s|IN (SELECT|
+    assert statement =~ ~s|FROM "acme"."tenant_rates"|
+  end
+
+  test "context multitenancy schema-qualifies the destroy target and its IN(subquery) to the tenant schema" do
+    changeset =
+      %TenantRate{code: "pro", valid_at: {~D[2026-01-01], nil}, monthly_price: Decimal.new("30.00")}
+      |> Map.update!(:__meta__, &Map.put(&1, :state, :loaded))
+      |> Ash.Changeset.for_destroy(:destroy, %{}, tenant: "acme")
+
+    {statement, _params} =
+      AshPostgres.DataLayer.build_for_portion_of_destroy(
+        TenantRate,
+        changeset,
+        :valid_at,
+        AshPostgres.TestRepo
+      )
+
+    assert statement =~ ~s|DELETE FROM "acme"."tenant_rates" FOR PORTION OF "valid_at"|
+    assert statement =~ ~s|IN (SELECT|
+    assert statement =~ ~s|FROM "acme"."tenant_rates"|
   end
 end
