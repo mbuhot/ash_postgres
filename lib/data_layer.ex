@@ -4114,19 +4114,21 @@ defmodule AshPostgres.DataLayer do
   end
 
   defp for_portion_of_update(resource, changeset, period) do
-    {lower, upper} = Ash.Changeset.get_attribute(changeset, period)
-    set_fields = Map.keys(changeset.attributes) -- [period]
+    repo = AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
+    set = Map.delete(storage_changes(resource, changeset, repo), period)
 
-    if set_fields == [] do
+    if set == %{} do
       raise ArgumentError,
             "temporal update for #{inspect(resource)} has no changes outside the #{period} period"
     end
 
-    {portion_sql, params} = temporal_portion(lower, upper, [lower])
-    {set_sql, params} = temporal_assignments(resource, changeset, set_fields, params)
-    {where_sql, params} = temporal_identity(resource, changeset.data, period, params)
+    {portion_sql, params} =
+      period_bounds(Ash.Changeset.get_attribute(changeset, period), subtype(resource, period), [])
 
-    temporal_repo(resource, changeset).query!(
+    {set_sql, params} = set_clause(set, params)
+    {where_sql, params} = identity_clause(resource, changeset.data, period, params)
+
+    repo.query!(
       "UPDATE #{table(resource, changeset)} FOR PORTION OF #{period} #{portion_sql} " <>
         "SET #{set_sql} WHERE #{where_sql}",
       params
@@ -4136,11 +4138,14 @@ defmodule AshPostgres.DataLayer do
   end
 
   defp for_portion_of_destroy(resource, changeset, period) do
-    {lower, upper} = Map.get(changeset.data, period)
-    {portion_sql, params} = temporal_portion(lower, upper, [lower])
-    {where_sql, params} = temporal_identity(resource, changeset.data, period, params)
+    repo = AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
 
-    temporal_repo(resource, changeset).query!(
+    {portion_sql, params} =
+      period_bounds(Map.get(changeset.data, period), subtype(resource, period), [])
+
+    {where_sql, params} = identity_clause(resource, changeset.data, period, params)
+
+    repo.query!(
       "DELETE FROM #{table(resource, changeset)} FOR PORTION OF #{period} #{portion_sql} " <>
         "WHERE #{where_sql}",
       params
@@ -4149,42 +4154,66 @@ defmodule AshPostgres.DataLayer do
     :ok
   end
 
-  defp temporal_portion(%Date{}, nil, params),
-    do: {"FROM $#{length(params)}::date TO NULL", params}
+  # Reuse the data layer's own dumping: build the Ecto changeset a normal update would
+  # use, whose `.changes` is the attribute => dumped-native-value map.
+  defp storage_changes(resource, changeset, repo) do
+    changeset.data
+    |> Map.update!(:__meta__, &Map.put(&1, :source, table(resource, changeset)))
+    |> ecto_changeset(changeset, :update, repo, true)
+    |> Map.fetch!(:changes)
+  end
 
-  defp temporal_portion(%Date{}, %Date{} = upper, params),
-    do: {"FROM $#{length(params)}::date TO $#{length(params) + 1}::date", params ++ [upper]}
+  # The FROM/TO bounds need an explicit cast to the range's subtype: a bare parameter
+  # in `FROM $1 TO NULL` is ambiguous to PostgreSQL.
+  defp period_bounds({lower, upper}, subtype, params) do
+    params = params ++ [lower]
+    from_sql = "FROM $#{length(params)}::#{subtype}"
 
-  defp temporal_assignments(resource, changeset, fields, params) do
+    case upper do
+      nil -> {"#{from_sql} TO NULL", params}
+      _ -> {"#{from_sql} TO $#{length(params) + 1}::#{subtype}", params ++ [upper]}
+    end
+  end
+
+  defp set_clause(changes, params) do
     {fragments, params} =
-      Enum.reduce(fields, {[], params}, fn field, {fragments, params} ->
-        value = temporal_dump(resource, field, Ash.Changeset.get_attribute(changeset, field))
-        {fragments ++ ["#{field} = $#{length(params) + 1}"], params ++ [value]}
+      Enum.reduce(changes, {[], params}, fn {column, value}, {fragments, params} ->
+        {fragments ++ ["#{column} = $#{length(params) + 1}"], params ++ [value]}
       end)
 
     {Enum.join(fragments, ", "), params}
   end
 
-  defp temporal_identity(resource, data, period, params) do
+  defp identity_clause(resource, data, period, params) do
     fields = Ash.Resource.Info.primary_key(resource) -- [period]
 
     {fragments, params} =
       Enum.reduce(fields, {[], params}, fn field, {fragments, params} ->
-        value = temporal_dump(resource, field, Map.get(data, field))
+        value = dump_attribute(resource, field, Map.get(data, field))
         {fragments ++ ["#{field} = $#{length(params) + 1}"], params ++ [value]}
       end)
 
     {Enum.join(fragments, " AND "), params}
   end
 
-  defp temporal_dump(resource, field, value) do
+  defp dump_attribute(resource, field, value) do
     attribute = Ash.Resource.Info.attribute(resource, field)
     {:ok, dumped} = Ash.Type.dump_to_native(attribute.type, value, attribute.constraints)
     dumped
   end
 
-  defp temporal_repo(resource, changeset),
-    do: AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
+  defp subtype(resource, period) do
+    attribute = Ash.Resource.Info.attribute(resource, period)
+
+    case Ash.Type.storage_type(attribute.type, attribute.constraints) do
+      :daterange -> "date"
+      :tsrange -> "timestamp"
+      :tstzrange -> "timestamptz"
+      :int4range -> "integer"
+      :int8range -> "bigint"
+      :numrange -> "numeric"
+    end
+  end
 
   @impl true
 
