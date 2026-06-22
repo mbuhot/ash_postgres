@@ -14,6 +14,7 @@ defmodule AshPostgres.ForPortionOfTest do
 
   require Ash.Query
 
+  alias AshPostgres.Test.RoomBooking
   alias AshPostgres.Test.TierPrice
 
   # FOR PORTION OF and WITHOUT OVERLAPS primary keys require PostgreSQL 18+.
@@ -67,5 +68,59 @@ defmodule AshPostgres.ForPortionOfTest do
     |> Ash.destroy!()
 
     assert versions("pro") == [{{~D[2026-01-01], ~D[2026-06-16]}, Decimal.new("30.00")}]
+  end
+
+  defp create_booking(room, status, from, to) do
+    RoomBooking
+    |> Ash.Changeset.for_create(:create, %{room: room, status: status, period: {from, to}})
+    |> Ash.create!()
+  end
+
+  defp active_booking(room) do
+    RoomBooking
+    |> Ash.Query.filter(room == ^room)
+    |> Ash.read_one!()
+  end
+
+  defp bookings(room) do
+    RoomBooking
+    |> Ash.Query.filter(room == ^room)
+    |> Ash.Query.sort(period: :asc)
+    |> Ash.read!()
+    |> Enum.map(fn booking ->
+      {lower, upper} = booking.period
+      {to_second(lower), to_second(upper), booking.status}
+    end)
+  end
+
+  defp to_second(nil), do: nil
+  defp to_second(%DateTime{} = datetime), do: DateTime.truncate(datetime, :second)
+
+  test "tstzrange period: a plain update splits the booking into old- and new-status slices" do
+    create_booking("room-1", "tentative", ~U[2026-06-01 00:00:00Z], nil)
+
+    active_booking("room-1")
+    |> Ash.Changeset.for_update(:rebook, %{
+      status: "confirmed",
+      period: {~U[2026-06-16 00:00:00Z], nil}
+    })
+    |> Ash.update!()
+
+    assert bookings("room-1") == [
+             {~U[2026-06-01 00:00:00Z], ~U[2026-06-16 00:00:00Z], "tentative"},
+             {~U[2026-06-16 00:00:00Z], nil, "confirmed"}
+           ]
+  end
+
+  test "tstzrange period: a plain destroy clips the booking, leaving the earlier portion" do
+    create_booking("room-1", "tentative", ~U[2026-06-01 00:00:00Z], nil)
+
+    %{active_booking("room-1") | period: {~U[2026-06-16 00:00:00Z], nil}}
+    |> Ash.Changeset.for_destroy(:destroy)
+    |> Ash.destroy!()
+
+    assert bookings("room-1") == [
+             {~U[2026-06-01 00:00:00Z], ~U[2026-06-16 00:00:00Z], "tentative"}
+           ]
   end
 end
