@@ -16,6 +16,7 @@ defmodule AshPostgres.Test.TierPrice do
   postgres do
     table "tier_prices"
     repo AshPostgres.TestRepo
+    temporal_period :valid_at
     # The temporal DDL (WITHOUT OVERLAPS) is not expressible via the migration
     # generator, so the table is created by a hand-written migration.
     migrate? false

@@ -15,6 +15,7 @@ defmodule AshPostgres.Test.RoomBooking do
   postgres do
     table "room_bookings"
     repo AshPostgres.TestRepo
+    temporal_period :period
     migrate? false
   end
 

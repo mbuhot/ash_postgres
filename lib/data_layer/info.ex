@@ -91,6 +91,11 @@ defmodule AshPostgres.DataLayer.Info do
     Extension.get_opt(resource, [:postgres], :table, nil, true)
   end
 
+  @doc "The application-time period attribute for a temporal resource, or `nil`."
+  def temporal_period(resource) do
+    Extension.get_opt(resource, [:postgres], :temporal_period, nil, true)
+  end
+
   def simple_join_first_aggregates(resource) do
     Extension.get_opt(resource, [:postgres], :simple_join_first_aggregates, [])
   end
