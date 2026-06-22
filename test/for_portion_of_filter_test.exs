@@ -226,6 +226,24 @@ defmodule AshPostgres.ForPortionOfFilterTest do
     assert Enum.any?(errors, &match?(%Ash.Error.Changes.StaleRecord{}, &1))
   end
 
+  test "zero matching rows raises StaleRecord on destroy" do
+    create_rate(code: "pro", owner: "acme", price: "30.00", from: ~D[2026-01-01], to: nil, active: true)
+
+    rate =
+      ContractRate
+      |> Ash.Query.filter(code == "pro")
+      |> Ash.read_one!(tenant: "acme")
+
+    nonexistent = %{rate | code: "ghost", valid_at: {~D[2026-06-16], nil}}
+
+    assert {:error, %Ash.Error.Invalid{errors: errors}} =
+             nonexistent
+             |> Ash.Changeset.for_destroy(:destroy, %{}, tenant: "acme")
+             |> Ash.destroy()
+
+    assert Enum.any?(errors, &match?(%Ash.Error.Changes.StaleRecord{}, &1))
+  end
+
   test "RETURNING gives the real clipped slice, not a fabricated record" do
     create_rate(code: "pro", owner: "acme", price: "30.00", from: ~D[2026-01-01], to: nil)
 
