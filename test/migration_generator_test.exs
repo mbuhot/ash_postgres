@@ -6919,5 +6919,171 @@ defmodule AshPostgres.MigrationGeneratorTest do
       assert extension_migrations =~
                ~S[execute("CREATE EXTENSION IF NOT EXISTS \"btree_gist\"")]
     end
+
+    test "altering a normal table into a temporal table drops the normal key and adds a WITHOUT OVERLAPS key" do
+      defresource TemporalAlterAddBefore do
+        postgres do
+          table("temporal_alter_add")
+          repo(AshPostgres.TestRepo)
+        end
+
+        actions do
+          defaults([:create, :read, :update, :destroy])
+        end
+
+        attributes do
+          attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+          attribute(:valid_at, AshPostgres.Test.DateRange,
+            primary_key?: true,
+            allow_nil?: false,
+            public?: true
+          )
+
+          attribute(:monthly_price, :decimal, public?: true)
+        end
+      end
+
+      before_resources = [TemporalAlterAddBefore]
+
+      before_snapshots =
+        Enum.flat_map(
+          before_resources,
+          &AshPostgres.MigrationGenerator.get_snapshots(&1, before_resources)
+        )
+
+      defresource TemporalAlterAddAfter do
+        postgres do
+          table("temporal_alter_add")
+          repo(AshPostgres.TestRepo)
+          temporal_period(:valid_at)
+        end
+
+        actions do
+          defaults([:create, :read, :update, :destroy])
+        end
+
+        attributes do
+          attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+          attribute(:valid_at, AshPostgres.Test.DateRange,
+            primary_key?: true,
+            allow_nil?: false,
+            public?: true
+          )
+
+          attribute(:monthly_price, :decimal, public?: true)
+        end
+      end
+
+      after_resources = [TemporalAlterAddAfter]
+
+      after_snapshots =
+        Enum.flat_map(
+          after_resources,
+          &AshPostgres.MigrationGenerator.get_snapshots(&1, after_resources)
+        )
+
+      {up, down} =
+        before_snapshots
+        |> AshPostgres.MigrationGenerator.get_operations_from_snapshots(after_snapshots)
+        |> AshPostgres.MigrationGenerator.build_up_and_down()
+
+      assert up =~ ~S[drop constraint("temporal_alter_add", "temporal_alter_add_pkey")]
+
+      assert up =~
+               ~S[execute("ALTER TABLE \"temporal_alter_add\" ADD PRIMARY KEY (code, valid_at WITHOUT OVERLAPS)")]
+
+      assert down =~
+               ~S[execute("ALTER TABLE \"temporal_alter_add\" DROP constraint temporal_alter_add_pkey")]
+
+      assert down =~
+               ~S[execute("ALTER TABLE \"temporal_alter_add\" ADD PRIMARY KEY (code, valid_at)")]
+
+      refute down =~ "WITHOUT OVERLAPS"
+    end
+
+    test "altering a temporal table back to a normal table drops the WITHOUT OVERLAPS key and adds a normal key" do
+      defresource TemporalAlterRemoveBefore do
+        postgres do
+          table("temporal_alter_remove")
+          repo(AshPostgres.TestRepo)
+          temporal_period(:valid_at)
+        end
+
+        actions do
+          defaults([:create, :read, :update, :destroy])
+        end
+
+        attributes do
+          attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+          attribute(:valid_at, AshPostgres.Test.DateRange,
+            primary_key?: true,
+            allow_nil?: false,
+            public?: true
+          )
+
+          attribute(:monthly_price, :decimal, public?: true)
+        end
+      end
+
+      before_resources = [TemporalAlterRemoveBefore]
+
+      before_snapshots =
+        Enum.flat_map(
+          before_resources,
+          &AshPostgres.MigrationGenerator.get_snapshots(&1, before_resources)
+        )
+
+      defresource TemporalAlterRemoveAfter do
+        postgres do
+          table("temporal_alter_remove")
+          repo(AshPostgres.TestRepo)
+        end
+
+        actions do
+          defaults([:create, :read, :update, :destroy])
+        end
+
+        attributes do
+          attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+          attribute(:valid_at, AshPostgres.Test.DateRange,
+            primary_key?: true,
+            allow_nil?: false,
+            public?: true
+          )
+
+          attribute(:monthly_price, :decimal, public?: true)
+        end
+      end
+
+      after_resources = [TemporalAlterRemoveAfter]
+
+      after_snapshots =
+        Enum.flat_map(
+          after_resources,
+          &AshPostgres.MigrationGenerator.get_snapshots(&1, after_resources)
+        )
+
+      {up, down} =
+        before_snapshots
+        |> AshPostgres.MigrationGenerator.get_operations_from_snapshots(after_snapshots)
+        |> AshPostgres.MigrationGenerator.build_up_and_down()
+
+      assert up =~ ~S[drop constraint("temporal_alter_remove", "temporal_alter_remove_pkey")]
+
+      assert up =~
+               ~S[execute("ALTER TABLE \"temporal_alter_remove\" ADD PRIMARY KEY (code, valid_at)")]
+
+      refute up =~ "WITHOUT OVERLAPS"
+
+      assert down =~
+               ~S[execute("ALTER TABLE \"temporal_alter_remove\" DROP constraint temporal_alter_remove_pkey")]
+
+      assert down =~
+               ~S[execute("ALTER TABLE \"temporal_alter_remove\" ADD PRIMARY KEY (code, valid_at WITHOUT OVERLAPS)")]
+    end
   end
 end

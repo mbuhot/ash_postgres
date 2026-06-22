@@ -1253,7 +1253,7 @@ defmodule AshPostgres.MigrationGenerator.Operation do
 
   defmodule AddPrimaryKeyDown do
     @moduledoc false
-    defstruct [:schema, :table, :keys, :remove_old?, no_phase: true]
+    defstruct [:schema, :table, :keys, :remove_old?, :without_overlaps, no_phase: true]
 
     def up(_) do
       ""
@@ -1264,9 +1264,10 @@ defmodule AshPostgres.MigrationGenerator.Operation do
           table: table,
           remove_old?: remove_old?,
           keys: keys,
+          without_overlaps: without_overlaps,
           multitenancy: multitenancy
         }) do
-      keys = Enum.join(keys, ", ")
+      keys = key_list(keys, without_overlaps)
 
       cond do
         multitenancy.strategy == :context ->
@@ -1308,6 +1309,12 @@ defmodule AshPostgres.MigrationGenerator.Operation do
           execute("ALTER TABLE \\\"#{table}\\\" ADD PRIMARY KEY (#{keys})")
           """
       end
+    end
+
+    defp key_list(keys, nil), do: Enum.join(keys, ", ")
+
+    defp key_list(keys, without_overlaps) do
+      Enum.join(keys ++ ["#{without_overlaps} WITHOUT OVERLAPS"], ", ")
     end
   end
 
