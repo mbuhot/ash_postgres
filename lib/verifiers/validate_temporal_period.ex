@@ -42,9 +42,40 @@ defmodule AshPostgres.Verifiers.ValidateTemporalPeriod do
             "to identify the entity across its timeline"
         )
 
+      optimistic_lock_action = action_with_optimistic_lock(dsl) ->
+        error(
+          dsl,
+          "update/destroy action `#{inspect(optimistic_lock_action)}` uses `optimistic_lock`, " <>
+            "which is incompatible with a temporal timeline write. A version check binds to one " <>
+            "physical row, but a `FOR PORTION OF` mutation asserts values across a period and may " <>
+            "clip many period-rows. Track the version on a non-temporal header/entity resource " <>
+            "instead"
+        )
+
       true ->
         validate_btree_gist(dsl, period)
     end
+  end
+
+  # Optimistic locking guards a single physical row by comparing a stored version, but a
+  # temporal write targets a period that can span several period-rows, so the two are
+  # incoherent together. Returns the name of the first offending update/destroy action.
+  defp action_with_optimistic_lock(dsl) do
+    dsl
+    |> Verifier.get_entities([:actions])
+    |> Enum.filter(&(&1.type in [:update, :destroy]))
+    |> Enum.find(&optimistic_lock?/1)
+    |> case do
+      nil -> nil
+      action -> action.name
+    end
+  end
+
+  defp optimistic_lock?(action) do
+    Enum.any?(
+      action.changes,
+      &match?(%Ash.Resource.Change{change: {Ash.Resource.Change.OptimisticLock, _}}, &1)
+    )
   end
 
   # The generated `WITHOUT OVERLAPS` primary key is backed by a GiST exclusion constraint,

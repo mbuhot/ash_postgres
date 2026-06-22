@@ -6,8 +6,8 @@ defmodule AshPostgres.Test.ContractRate do
   @moduledoc """
   A temporal resource (entity key `code` + `daterange` period `valid_at`) carrying the
   scoping concerns the `FOR PORTION OF` rewrite must honour: attribute multitenancy on
-  `owner`, an optimistic-lock `version`, and an action-level `filter`. Used to prove the
-  rewrite threads `changeset.filter` into the mutation rather than dropping it.
+  `owner`, an atomically-incremented `version`, and an action-level `filter`. Used to prove
+  the rewrite threads `changeset.filter` into the mutation rather than dropping it.
   """
   use Ash.Resource,
     domain: AshPostgres.Test.Domain,
@@ -51,11 +51,6 @@ defmodule AshPostgres.Test.ContractRate do
       change fn changeset, _ ->
         Ash.Changeset.filter(changeset, expr(active == true))
       end
-    end
-
-    update :change_price_locked do
-      accept [:monthly_price, :valid_at]
-      change optimistic_lock(:version)
     end
 
     update :bump_version do

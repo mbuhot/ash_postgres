@@ -4,10 +4,10 @@
 
 defmodule AshPostgres.ForPortionOfFilterTest do
   @moduledoc """
-  The `FOR PORTION OF` rewrite must thread `changeset.filter` (policy/action filters,
-  attribute-multitenancy scoping, and the optimistic-lock predicate) into the mutation as
-  an entity-key `IN (<subquery>)` clause, return the real clipped row from `RETURNING`,
-  raise `StaleRecord` on a no-op, and translate constraint violations.
+  The `FOR PORTION OF` rewrite must thread `changeset.filter` (policy/action filters and
+  attribute-multitenancy scoping) into the mutation as an entity-key `IN (<subquery>)`
+  clause, return the real clipped row from `RETURNING`, raise `StaleRecord` on a no-op, and
+  translate constraint violations.
   """
   use AshPostgres.RepoCase, async: false
 
@@ -136,50 +136,6 @@ defmodule AshPostgres.ForPortionOfFilterTest do
            ]
 
     assert versions("globex", "pro") == [{{~D[2026-01-01], nil}, Decimal.new("99.00")}]
-  end
-
-  test "optimistic lock conflict surfaces as an error, not a silent no-op" do
-    create_rate(code: "pro", owner: "acme", price: "30.00", from: ~D[2026-01-01], to: nil, version: 1)
-
-    rate =
-      ContractRate
-      |> Ash.Query.filter(code == "pro")
-      |> Ash.read_one!(tenant: "acme")
-
-    stale = %{rate | version: 7}
-
-    assert {:error, %Ash.Error.Invalid{}} =
-             stale
-             |> Ash.Changeset.for_update(
-               :change_price_locked,
-               %{monthly_price: Decimal.new("60.00"), valid_at: {~D[2026-06-16], nil}},
-               tenant: "acme"
-             )
-             |> Ash.update()
-
-    assert versions("acme", "pro") == [{{~D[2026-01-01], nil}, Decimal.new("30.00")}]
-  end
-
-  test "a matching optimistic-locked update succeeds and clips" do
-    create_rate(code: "pro", owner: "acme", price: "30.00", from: ~D[2026-01-01], to: nil, version: 1)
-
-    rate =
-      ContractRate
-      |> Ash.Query.filter(code == "pro")
-      |> Ash.read_one!(tenant: "acme")
-
-    rate
-    |> Ash.Changeset.for_update(
-      :change_price_locked,
-      %{monthly_price: Decimal.new("60.00"), valid_at: {~D[2026-06-16], nil}},
-      tenant: "acme"
-    )
-    |> Ash.update!()
-
-    assert slices("acme", "pro") == [
-             {{~D[2026-01-01], ~D[2026-06-16]}, Decimal.new("30.00"), 1},
-             {{~D[2026-06-16], nil}, Decimal.new("60.00"), 2}
-           ]
   end
 
   test "an explicit atomic_update is applied to the clipped portion, not silently dropped" do

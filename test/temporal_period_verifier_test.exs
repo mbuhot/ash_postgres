@@ -8,7 +8,7 @@ defmodule AshPostgres.TemporalPeriodVerifierTest do
   least one other primary-key member as the entity key. These are compile-time checks, so
   they need no database and run on the default CI matrix.
   """
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   import Spark.Test
 
@@ -183,17 +183,91 @@ defmodule AshPostgres.TemporalPeriodVerifierTest do
     assert error.message =~ "at least one member other than"
   end
 
-  test "warns when a temporal resource is left migratable (migrate? true)" do
-    {message, _location} =
-      assert_dsl_warning do
-        defmodule TpMigratable do
+  test "rejects an optimistic_lock update action on a temporal resource" do
+    error =
+      assert_dsl_error do
+        defmodule TpOptimisticLock do
           use Ash.Resource,
             domain: nil,
             validate_domain_inclusion?: false,
             data_layer: AshPostgres.DataLayer
 
           postgres do
-            table("tp_migratable")
+            table("tp_optimistic_lock")
+            repo(AshPostgres.TestRepo)
+            temporal_period(:valid_at)
+            migrate?(false)
+          end
+
+          actions do
+            defaults([:read])
+
+            update :change_price do
+              accept([:monthly_price, :valid_at])
+              change(optimistic_lock(:version))
+            end
+          end
+
+          attributes do
+            attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+            attribute(:valid_at, AshPostgres.Test.DateRange,
+              primary_key?: true,
+              allow_nil?: false,
+              public?: true
+            )
+
+            attribute(:monthly_price, :decimal, public?: true)
+            attribute(:version, :integer, allow_nil?: false, default: 1, public?: true)
+          end
+        end
+      end
+
+    assert error.message =~ "optimistic_lock"
+  end
+
+  test "compiles when migrate? true and the repo installs btree_gist" do
+    refute_dsl_errors do
+      defmodule TpMigratableWithBtreeGist do
+        use Ash.Resource,
+          domain: nil,
+          validate_domain_inclusion?: false,
+          data_layer: AshPostgres.DataLayer
+
+        postgres do
+          table("tp_migratable_with_btree_gist")
+          repo(AshPostgres.TestRepo)
+          temporal_period(:valid_at)
+        end
+
+        attributes do
+          attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+          attribute(:valid_at, AshPostgres.Test.DateRange,
+            primary_key?: true,
+            allow_nil?: false,
+            public?: true
+          )
+        end
+      end
+    end
+  end
+
+  test "rejects migrate? true when the repo does not install btree_gist" do
+    previous = Application.get_env(:ash_postgres, :no_extensions, [])
+    Application.put_env(:ash_postgres, :no_extensions, ["btree_gist" | previous])
+    on_exit(fn -> Application.put_env(:ash_postgres, :no_extensions, previous) end)
+
+    error =
+      assert_dsl_error do
+        defmodule TpMissingBtreeGist do
+          use Ash.Resource,
+            domain: nil,
+            validate_domain_inclusion?: false,
+            data_layer: AshPostgres.DataLayer
+
+          postgres do
+            table("tp_missing_btree_gist")
             repo(AshPostgres.TestRepo)
             temporal_period(:valid_at)
           end
@@ -210,6 +284,6 @@ defmodule AshPostgres.TemporalPeriodVerifierTest do
         end
       end
 
-    assert message =~ "WITHOUT OVERLAPS"
+    assert error.message =~ "btree_gist"
   end
 end

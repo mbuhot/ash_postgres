@@ -4110,17 +4110,22 @@ defmodule AshPostgres.DataLayer do
 
   # === SQL:2011 application-time temporal support ==========================
   #
-  # A resource opts in by naming its period attribute with `temporal_period` in
-  # the `postgres` block (validated by `AshPostgres.Verifiers.ValidateTemporalPeriod`:
-  # it must be a range-typed primary-key member, with at least one other key member
-  # identifying the entity across its timeline). Ordinary update/destroy operations
-  # on such a resource are rewritten to `UPDATE/DELETE ... FOR PORTION OF`: PostgreSQL
-  # clips the matching rows to the period being written and DB-side inserts any
-  # leftover remainder.
+  # A temporal resource is a timeline: the stored rows are non-overlapping period-rows for
+  # one entity, and a loaded record is a snapshot of that timeline at a point. A resource
+  # opts in by naming its period attribute with `temporal_period` in the `postgres` block
+  # (validated by `AshPostgres.Verifiers.ValidateTemporalPeriod`: it must be a range-typed
+  # primary-key member, with at least one other key member identifying the entity across its
+  # timeline).
   #
-  # The period bounds come from the period attribute's value on the changeset
-  # (the change for updates, the record for destroys); the SET clause is the
-  # other attribute changes; the WHERE clause is the rest of the primary key.
+  # A mutation asserts "these values for this period": the period attribute (`valid_at`) is
+  # the asserted portion — defaulting to the snapshot's own period — and the other attribute
+  # changes are the values to assert over it. Ordinary update/destroy operations are therefore
+  # rewritten to `UPDATE/DELETE ... FOR PORTION OF`: PostgreSQL clips the matching period-rows
+  # to the asserted portion and DB-side inserts any leftover remainder.
+  #
+  # The portion bounds come from the period attribute's value on the changeset (the change for
+  # updates, the record for destroys); the SET clause is the other attribute changes; the WHERE
+  # clause is the rest of the primary key (the entity key).
 
   defp temporal_period_attribute(resource) do
     AshPostgres.DataLayer.Info.temporal_period(resource)
@@ -4132,15 +4137,15 @@ defmodule AshPostgres.DataLayer do
 
     case run_for_portion_of(repo, changeset, resource, :update, statement, params) do
       {:ok, result} ->
-        case load_returned_records(resource, columns, result) do
-          [] ->
+        case as_of_from_slice(load_returned_records(resource, columns, result), period) do
+          nil ->
             {:error,
              Ash.Error.Changes.StaleRecord.exception(
                resource: resource,
                filter: changeset.filter
              )}
 
-          [record | _] ->
+          record ->
             maybe_update_tenant(resource, changeset, record)
             {:ok, record}
         end
@@ -4259,15 +4264,15 @@ defmodule AshPostgres.DataLayer do
   end
 
   # Builds a `(<full primary key>) IN (<subquery>)` clause carrying `changeset.filter`
-  # (policy/auth filters, base/soft-delete filters, attribute-multitenancy scoping, and the
-  # optimistic-lock predicate). Reuses the data layer's own query builders so the filter is
-  # rendered exactly as the standard `do_update`/`do_destroy` paths enforce it.
+  # (policy/auth filters, base/soft-delete filters, and attribute-multitenancy scoping).
+  # Reuses the data layer's own query builders so the filter is rendered exactly as the
+  # standard `do_update`/`do_destroy` paths enforce it.
   #
   # The correlation key is the FULL primary key — including the period column — so the filter
   # is evaluated against the exact stored rows `FOR PORTION OF` will clip, not merely against
   # any period-row sharing the entity key. (A temporal entity holds many non-overlapping
   # period-rows; correlating on the entity key alone would let a sibling row satisfy the
-  # filter while the clip lands on a non-matching row — a scope/optimistic-lock bypass.)
+  # filter while the clip lands on a non-matching row — a scope bypass.)
   #
   # Returns `{nil, []}` when there is no filter and no tenant scoping, so the clause is omitted.
   defp filter_subquery(resource, changeset, _period, repo) do
@@ -4322,6 +4327,39 @@ defmodule AshPostgres.DataLayer do
 
     {sql, attributes}
   end
+
+  # A temporal update can clip several period-rows, so `RETURNING` yields one slice per affected
+  # row in unspecified order. The snapshot to hand back is the earliest one — the as-of-`from`
+  # slice (the clip starts at `from`, so the earliest returned slice is the one covering it).
+  # Returns nil for 0 rows, which the caller surfaces as `StaleRecord`. The lower bounds are
+  # compared *semantically* (`Date.compare/2` etc.): range subtypes do not order by Erlang term
+  # order, so a positional/`min_by` sort would be wrong.
+  defp as_of_from_slice([], _period), do: nil
+
+  defp as_of_from_slice([first | rest], period) do
+    Enum.reduce(rest, first, fn record, earliest ->
+      if lower_before?(period_lower(Map.get(record, period)), period_lower(Map.get(earliest, period))) do
+        record
+      else
+        earliest
+      end
+    end)
+  end
+
+  defp period_lower({lower, _upper}), do: lower
+
+  defp lower_before?(nil, _other), do: true
+  defp lower_before?(_lower, nil), do: false
+  defp lower_before?(lower, other), do: compare_lower(lower, other) == :lt
+
+  defp compare_lower(%module{} = lower, %module{} = other)
+       when module in [Date, DateTime, NaiveDateTime, Time],
+       do: module.compare(lower, other)
+
+  defp compare_lower(%Decimal{} = lower, %Decimal{} = other), do: Decimal.compare(lower, other)
+  defp compare_lower(lower, other) when lower < other, do: :lt
+  defp compare_lower(lower, other) when lower > other, do: :gt
+  defp compare_lower(_lower, _other), do: :eq
 
   defp load_returned_records(resource, columns, %{rows: rows}) do
     Enum.map(rows, fn row ->
@@ -4428,7 +4466,9 @@ defmodule AshPostgres.DataLayer do
     case AshSql.Atomics.query_with_atomics(resource, query, nil, changeset.atomics, changes, []) do
       {:empty, _query} ->
         raise ArgumentError,
-              "temporal update for #{inspect(resource)} has no changes outside the #{period} period"
+              "temporal update for #{inspect(resource)} sets no attributes: a temporal write must " <>
+                "set at least one non-period attribute. `#{period}` only selects the portion to " <>
+                "assert values for, it is not itself an assertable value"
 
       {:ok, query} ->
         {sql, set_params} = repo.to_sql(:update_all, Map.delete(query, :__ash_bindings__))

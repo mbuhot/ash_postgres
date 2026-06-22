@@ -124,6 +124,35 @@ defmodule AshPostgres.ForPortionOfTest do
            ]
   end
 
+  test "an update spanning multiple rows returns the slice whose date lower bound equals the asserted from" do
+    create_price("pro", "100.00", ~D[2020-01-01], ~D[2025-01-01])
+    create_price("pro", "200.00", ~D[2025-01-01], nil)
+
+    snapshot =
+      TierPrice
+      |> Ash.Query.filter(code == "pro")
+      |> Ash.Query.filter(valid_at == ^{~D[2020-01-01], ~D[2025-01-01]})
+      |> Ash.read_one!()
+
+    updated =
+      snapshot
+      |> Ash.Changeset.for_update(:change_price, %{
+        monthly_price: Decimal.new("555.00"),
+        valid_at: {~D[2023-12-31], ~D[2027-06-15]}
+      })
+      |> Ash.update!()
+
+    assert updated.valid_at == {~D[2023-12-31], ~D[2025-01-01]}
+    assert updated.monthly_price == Decimal.new("555.00")
+
+    assert versions("pro") == [
+             {{~D[2020-01-01], ~D[2023-12-31]}, Decimal.new("100.00")},
+             {{~D[2023-12-31], ~D[2025-01-01]}, Decimal.new("555.00")},
+             {{~D[2025-01-01], ~D[2027-06-15]}, Decimal.new("555.00")},
+             {{~D[2027-06-15], nil}, Decimal.new("200.00")}
+           ]
+  end
+
   defp create_booking(room, status, from, to) do
     RoomBooking
     |> Ash.Changeset.for_create(:create, %{room: room, status: status, period: {from, to}})
