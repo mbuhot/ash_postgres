@@ -51,10 +51,11 @@ defmodule AshPostgres.TemporalDetectionTest do
     end
   end
 
-  test "a declared temporal resource is routed off the atomic query path (so it can emit FOR PORTION OF)" do
+  test "a declared temporal resource is routed off every query/many mutation path (so it can emit FOR PORTION OF)" do
     assert AshPostgres.DataLayer.Info.temporal_period(Declared) == :valid_at
     refute AshPostgres.DataLayer.can?(Declared, :update_query)
     refute AshPostgres.DataLayer.can?(Declared, :destroy_query)
+    refute AshPostgres.DataLayer.can?(Declared, :update_many)
   end
 
   test "a composite PK with a range member but no temporal_period is an ordinary resource" do

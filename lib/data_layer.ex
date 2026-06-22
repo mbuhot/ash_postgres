@@ -705,7 +705,10 @@ defmodule AshPostgres.DataLayer do
   def can?(resource, :update_many) do
     # `update_many` is implemented with a single SQL MERGE, which (with RETURNING + merge_action)
     # requires PostgreSQL 17, and the same tenant-management restriction as `update_query`.
-    AshPostgres.DataLayer.Info.pg_version_matches?(resource, ">= 17.0.0") &&
+    # Temporal resources are excluded so bulk updates fall back to the per-record path, which
+    # emits `FOR PORTION OF`; a MERGE has no `FOR PORTION OF` and would apply wrong semantics.
+    is_nil(temporal_period_attribute(resource)) &&
+      AshPostgres.DataLayer.Info.pg_version_matches?(resource, ">= 17.0.0") &&
       !AshPostgres.DataLayer.Info.manage_tenant_update?(resource)
   end
 
