@@ -4125,6 +4125,38 @@ defmodule AshPostgres.DataLayer do
 
   defp for_portion_of_update(resource, changeset, period) do
     repo = AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
+    {statement, params, columns} = build_for_portion_of_update(resource, changeset, period, repo)
+
+    case run_for_portion_of(repo, changeset, resource, :update, statement, params) do
+      {:ok, result} ->
+        case load_returned_records(resource, columns, result) do
+          [] ->
+            {:error,
+             Ash.Error.Changes.StaleRecord.exception(
+               resource: resource,
+               filter: changeset.filter
+             )}
+
+          [record | _] ->
+            maybe_update_tenant(resource, changeset, record)
+            {:ok, record}
+        end
+
+      {:error, error} ->
+        {:error, error}
+
+      {:error, :no_rollback, error} ->
+        {:error, :no_rollback, error}
+    end
+  end
+
+  @doc false
+  # Assembles the `UPDATE ... FOR PORTION OF ... RETURNING` statement and its ordered
+  # parameter list. Parameter ordering is `subquery_params ++ [from, to] ++ set_values ++
+  # entity_key_values`, so the embedded filter subquery keeps its native `$1..$k` and the
+  # hand-built clauses reference `$k+1 ...` (no placeholder rewriting). Exposed for unit
+  # testing the (no-)filter SQL shape without a database round trip.
+  def build_for_portion_of_update(resource, changeset, period, repo) do
     set = Map.delete(storage_changes(resource, changeset, repo), period)
 
     if set == %{} do
@@ -4132,36 +4164,194 @@ defmodule AshPostgres.DataLayer do
             "temporal update for #{inspect(resource)} has no changes outside the #{period} period"
     end
 
+    {filter_sql, subquery_params} = filter_subquery(resource, changeset, period, repo)
+
     {portion_sql, params} =
-      period_bounds(Ash.Changeset.get_attribute(changeset, period), subtype(resource, period), [])
+      period_bounds(
+        Ash.Changeset.get_attribute(changeset, period),
+        subtype(resource, period),
+        subquery_params
+      )
 
     {set_sql, params} = set_clause(set, params)
-    {where_sql, params} = identity_clause(resource, changeset.data, period, params)
+    {where_sql, params} = identity_clause(resource, changeset.data, period, filter_sql, params)
 
-    repo.query!(
-      "UPDATE #{table(resource, changeset)} FOR PORTION OF #{period} #{portion_sql} " <>
-        "SET #{set_sql} WHERE #{where_sql}",
-      params
-    )
+    {returning_sql, columns} = returning_clause(resource)
 
-    Ash.Changeset.apply_attributes(changeset)
+    statement =
+      "UPDATE #{qualified_table(resource, changeset)} FOR PORTION OF #{quote_identifier(period)} #{portion_sql} " <>
+        "SET #{set_sql} WHERE #{where_sql} RETURNING #{returning_sql}"
+
+    {statement, params, columns}
   end
 
   defp for_portion_of_destroy(resource, changeset, period) do
     repo = AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
+    {statement, params} = build_for_portion_of_destroy(resource, changeset, period, repo)
+
+    case run_for_portion_of(repo, changeset, resource, :delete, statement, params) do
+      {:ok, %{num_rows: 0}} ->
+        {:error,
+         Ash.Error.Changes.StaleRecord.exception(
+           resource: resource,
+           filter: changeset.filter
+         )}
+
+      {:ok, _} ->
+        :ok
+
+      {:error, error} ->
+        {:error, error}
+
+      {:error, :no_rollback, error} ->
+        {:error, :no_rollback, error}
+    end
+  end
+
+  @doc false
+  def build_for_portion_of_destroy(resource, changeset, period, repo) do
+    {filter_sql, subquery_params} = filter_subquery(resource, changeset, period, repo)
 
     {portion_sql, params} =
-      period_bounds(Map.get(changeset.data, period), subtype(resource, period), [])
+      period_bounds(Map.get(changeset.data, period), subtype(resource, period), subquery_params)
 
-    {where_sql, params} = identity_clause(resource, changeset.data, period, params)
+    {where_sql, params} = identity_clause(resource, changeset.data, period, filter_sql, params)
 
-    repo.query!(
-      "DELETE FROM #{table(resource, changeset)} FOR PORTION OF #{period} #{portion_sql} " <>
-        "WHERE #{where_sql}",
-      params
-    )
+    statement =
+      "DELETE FROM #{qualified_table(resource, changeset)} FOR PORTION OF #{quote_identifier(period)} #{portion_sql} " <>
+        "WHERE #{where_sql}"
 
-    :ok
+    {statement, params}
+  end
+
+  # Runs the hand-built FOR PORTION OF statement inside the same savepoint and error
+  # translation the normal mutation paths use, so a WITHOUT OVERLAPS exclusion (or any
+  # FK/check/not-null violation) surfaces as a translated `Ash.Error` rather than a raw
+  # `Postgrex.Error`, and failure is savepoint-isolated.
+  defp run_for_portion_of(repo, changeset, resource, action, statement, params) do
+    ecto_changeset =
+      case changeset.data do
+        %Ash.Changeset.OriginalDataNotAvailable{} -> changeset.resource.__struct__()
+        data -> data
+      end
+      |> Map.update!(:__meta__, &Map.put(&1, :source, table(resource, changeset)))
+      |> ecto_changeset(changeset, action, repo, true)
+
+    savepoint_query = %{
+      __ash_bindings__: %{
+        expression_accumulator: %AshSql.Expr.ExprInfo{has_error?: true}
+      }
+    }
+
+    try do
+      result =
+        with_savepoint(repo, savepoint_query, fn ->
+          repo.query!(statement, params)
+        end)
+
+      {:ok, result}
+    rescue
+      e ->
+        handle_raised_error(
+          e,
+          __STACKTRACE__,
+          {:ecto_changeset, action, ecto_changeset},
+          resource
+        )
+    end
+  end
+
+  # Builds the entity-key `IN (<subquery>)` clause carrying `changeset.filter` (policy/auth
+  # filters, base/soft-delete filters, attribute-multitenancy scoping, and the optimistic
+  # lock predicate). Reuses the data layer's own query builders so the filter is rendered
+  # exactly as the standard `do_update`/`do_destroy` paths enforce it. Returns `{nil, []}`
+  # when there is no filter and no tenant scoping, so the `IN (...)` clause is omitted.
+  defp filter_subquery(resource, changeset, period, repo) do
+    if filter_subquery_required?(changeset) do
+      entity_keys = Ash.Resource.Info.primary_key(resource) -- [period]
+      source = resolve_source(resource, changeset)
+
+      query =
+        from(row in source, as: ^0)
+        |> AshSql.Bindings.default_bindings(
+          resource,
+          AshPostgres.SqlImplementation,
+          changeset.context
+        )
+
+      {:ok, query} = filter(query, changeset.filter, resource)
+      {:ok, query} = set_tenant(resource, query, changeset.tenant)
+
+      query =
+        query
+        |> Ecto.Query.select([row], map(row, ^entity_keys))
+        |> Map.delete(:__ash_bindings__)
+
+      {sql, params} = repo.to_sql(:all, query)
+
+      columns = Enum.map_join(entity_keys, ", ", &quote_identifier/1)
+      {"(#{columns}) IN (#{sql})", params}
+    else
+      {nil, []}
+    end
+  end
+
+  defp filter_subquery_required?(changeset) do
+    not (empty_filter?(changeset.filter) and is_nil(changeset.tenant))
+  end
+
+  defp empty_filter?(nil), do: true
+  defp empty_filter?(%Ash.Filter{expression: nil}), do: true
+  defp empty_filter?(_), do: false
+
+  defp returning_clause(resource) do
+    columns =
+      resource
+      |> Ash.Resource.Info.attributes()
+      |> Enum.map(& &1.name)
+
+    {Enum.map_join(columns, ", ", &quote_identifier/1), columns}
+  end
+
+  defp load_returned_records(resource, columns, %{rows: rows}) do
+    Enum.map(rows, fn row ->
+      attrs =
+        columns
+        |> Enum.zip(row)
+        |> Map.new(fn {column, value} ->
+          attribute = Ash.Resource.Info.attribute(resource, column)
+          {:ok, casted} = Ash.Type.cast_stored(attribute.type, value, attribute.constraints)
+          {column, casted}
+        end)
+
+      resource
+      |> struct(attrs)
+      |> Map.put(:__meta__, %Ecto.Schema.Metadata{
+        state: :loaded,
+        source: AshPostgres.DataLayer.Info.table(resource)
+      })
+    end)
+  end
+
+  defp quote_identifier(name) do
+    ~s("#{name}")
+  end
+
+  defp qualified_table(resource, changeset) do
+    table = table(resource, changeset)
+
+    case table_schema(resource, changeset) do
+      nil -> quote_identifier(table)
+      schema -> "#{quote_identifier(schema)}.#{quote_identifier(table)}"
+    end
+  end
+
+  defp table_schema(resource, changeset) do
+    if Ash.Resource.Info.multitenancy_strategy(resource) == :context && changeset.tenant do
+      to_string(changeset.tenant)
+    else
+      AshPostgres.DataLayer.Info.schema(resource)
+    end
   end
 
   # Reuse the data layer's own dumping: build the Ecto changeset a normal update would
@@ -4188,20 +4378,26 @@ defmodule AshPostgres.DataLayer do
   defp set_clause(changes, params) do
     {fragments, params} =
       Enum.reduce(changes, {[], params}, fn {column, value}, {fragments, params} ->
-        {fragments ++ ["#{column} = $#{length(params) + 1}"], params ++ [value]}
+        {fragments ++ ["#{quote_identifier(column)} = $#{length(params) + 1}"], params ++ [value]}
       end)
 
     {Enum.join(fragments, ", "), params}
   end
 
-  defp identity_clause(resource, data, period, params) do
+  defp identity_clause(resource, data, period, filter_sql, params) do
     fields = Ash.Resource.Info.primary_key(resource) -- [period]
 
     {fragments, params} =
       Enum.reduce(fields, {[], params}, fn field, {fragments, params} ->
         value = dump_attribute(resource, field, Map.get(data, field))
-        {fragments ++ ["#{field} = $#{length(params) + 1}"], params ++ [value]}
+        {fragments ++ ["#{quote_identifier(field)} = $#{length(params) + 1}"], params ++ [value]}
       end)
+
+    fragments =
+      case filter_sql do
+        nil -> fragments
+        sql -> fragments ++ [sql]
+      end
 
     {Enum.join(fragments, " AND "), params}
   end

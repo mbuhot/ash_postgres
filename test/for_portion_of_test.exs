@@ -17,8 +17,8 @@ defmodule AshPostgres.ForPortionOfTest do
   alias AshPostgres.Test.RoomBooking
   alias AshPostgres.Test.TierPrice
 
-  # FOR PORTION OF and WITHOUT OVERLAPS primary keys require PostgreSQL 18+.
-  @moduletag :postgres_18
+  # FOR PORTION OF and WITHOUT OVERLAPS primary keys require PostgreSQL 19.
+  @moduletag :postgres_19
 
   defp create_price(code, price, from, to) do
     TierPrice
