@@ -4173,7 +4173,7 @@ defmodule AshPostgres.DataLayer do
     {returning_sql, columns} = returning_clause(resource)
 
     statement =
-      "UPDATE #{qualified_table(resource, changeset)} FOR PORTION OF #{quote_identifier(period)} #{portion_sql} " <>
+      "UPDATE #{qualified_table(resource, changeset)} FOR PORTION OF #{quote_identifier(storage_name(resource, period))} #{portion_sql} " <>
         "SET #{set_sql} WHERE #{where_sql} RETURNING #{returning_sql}"
 
     {statement, params, columns}
@@ -4212,7 +4212,7 @@ defmodule AshPostgres.DataLayer do
     {where_sql, params} = identity_clause(resource, changeset.data, period, filter_sql, params)
 
     statement =
-      "DELETE FROM #{qualified_table(resource, changeset)} FOR PORTION OF #{quote_identifier(period)} #{portion_sql} " <>
+      "DELETE FROM #{qualified_table(resource, changeset)} FOR PORTION OF #{quote_identifier(storage_name(resource, period))} #{portion_sql} " <>
         "WHERE #{where_sql}"
 
     {statement, params}
@@ -4290,7 +4290,9 @@ defmodule AshPostgres.DataLayer do
 
       {sql, params} = repo.to_sql(:all, query)
 
-      columns = Enum.map_join(keys, ", ", &quote_identifier/1)
+      columns =
+        Enum.map_join(keys, ", ", &quote_identifier(storage_name(resource, &1)))
+
       {"(#{columns}) IN (#{sql})", params}
     else
       {nil, []}
@@ -4305,13 +4307,17 @@ defmodule AshPostgres.DataLayer do
   defp empty_filter?(%Ash.Filter{expression: nil}), do: true
   defp empty_filter?(_), do: false
 
+  # Returns the `RETURNING` SQL (storage column names) alongside the attribute names in the
+  # same order, so `load_returned_records/3` can zip each returned value back to its attribute.
   defp returning_clause(resource) do
-    columns =
+    attributes =
       resource
       |> Ash.Resource.Info.attributes()
       |> Enum.map(& &1.name)
 
-    {Enum.map_join(columns, ", ", &quote_identifier/1), columns}
+    sql = Enum.map_join(attributes, ", ", &quote_identifier(storage_name(resource, &1)))
+
+    {sql, attributes}
   end
 
   defp load_returned_records(resource, columns, %{rows: rows}) do
@@ -4332,6 +4338,11 @@ defmodule AshPostgres.DataLayer do
         source: AshPostgres.DataLayer.Info.table(resource)
       })
     end)
+  end
+
+  # The storage (DB column) name for an attribute, honouring its `source:` mapping.
+  defp storage_name(resource, attribute_name) do
+    Ash.Resource.Info.attribute(resource, attribute_name).source || attribute_name
   end
 
   defp quote_identifier(name) do
@@ -4462,7 +4473,8 @@ defmodule AshPostgres.DataLayer do
     {fragments, params} =
       Enum.reduce(fields, {[], params}, fn field, {fragments, params} ->
         value = dump_attribute(resource, field, Map.get(data, field))
-        {fragments ++ ["#{quote_identifier(field)} = $#{length(params) + 1}"], params ++ [value]}
+        column = quote_identifier(storage_name(resource, field))
+        {fragments ++ ["#{column} = $#{length(params) + 1}"], params ++ [value]}
       end)
 
     fragments =

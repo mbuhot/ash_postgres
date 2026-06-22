@@ -13,6 +13,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
   require Ash.Expr
 
   alias AshPostgres.Test.ContractRate
+  alias AshPostgres.Test.SourcedRate
   alias AshPostgres.Test.TierPrice
 
   test "an empty filter produces no IN(subquery) clause" do
@@ -74,5 +75,73 @@ defmodule AshPostgres.ForPortionOfSqlTest do
 
     assert statement =~ "WHERE (c0.\"active\"::boolean = $1::boolean)"
     assert [true | _rest] = params
+  end
+
+  test "source-mapped attributes emit storage column names in update SQL" do
+    changeset =
+      %SourcedRate{code: "pro", valid_at: {~D[2026-01-01], nil}, monthly_price: Decimal.new("30.00")}
+      |> Map.update!(:__meta__, &Map.put(&1, :state, :loaded))
+      |> Ash.Changeset.for_update(:change_price, %{
+        monthly_price: Decimal.new("60.00"),
+        valid_at: {~D[2026-06-16], nil}
+      })
+
+    {statement, _params, _columns} =
+      AshPostgres.DataLayer.build_for_portion_of_update(
+        SourcedRate,
+        changeset,
+        :valid_at,
+        AshPostgres.TestRepo
+      )
+
+    assert statement =~ ~s|FOR PORTION OF "validPeriod"|
+    assert statement =~ ~s|WHERE "entityCode" = $|
+    assert statement =~ ~s|RETURNING "entityCode", "validPeriod", "monthlyPrice"|
+
+    refute statement =~ ~s|"valid_at"|
+    refute statement =~ ~s|"code"|
+    refute statement =~ ~s|"monthly_price"|
+  end
+
+  test "source-mapped attributes emit storage columns in the (cols) IN(subquery) left side" do
+    changeset =
+      %SourcedRate{code: "pro", valid_at: {~D[2026-01-01], nil}, monthly_price: Decimal.new("30.00")}
+      |> Map.update!(:__meta__, &Map.put(&1, :state, :loaded))
+      |> Ash.Changeset.for_update(:change_price, %{
+        monthly_price: Decimal.new("60.00"),
+        valid_at: {~D[2026-06-16], nil}
+      })
+      |> Ash.Changeset.filter(Ash.Expr.expr(monthly_price == 30))
+
+    {statement, _params, _columns} =
+      AshPostgres.DataLayer.build_for_portion_of_update(
+        SourcedRate,
+        changeset,
+        :valid_at,
+        AshPostgres.TestRepo
+      )
+
+    assert statement =~ ~s|("entityCode", "validPeriod") IN (|
+  end
+
+  test "source-mapped attributes emit storage column names in destroy SQL" do
+    changeset =
+      %SourcedRate{code: "pro", valid_at: {~D[2026-01-01], nil}, monthly_price: Decimal.new("30.00")}
+      |> Map.update!(:__meta__, &Map.put(&1, :state, :loaded))
+      |> Ash.Changeset.for_destroy(:destroy, %{})
+
+    {statement, _params} =
+      AshPostgres.DataLayer.build_for_portion_of_destroy(
+        SourcedRate,
+        changeset,
+        :valid_at,
+        AshPostgres.TestRepo
+      )
+
+    assert statement =~ ~s|FOR PORTION OF "validPeriod"|
+    assert statement =~ ~s|WHERE "entityCode" = $|
+
+    refute statement =~ ~s|"valid_at"|
+    refute statement =~ ~s|"code"|
   end
 end
