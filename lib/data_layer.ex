@@ -677,11 +677,14 @@ defmodule AshPostgres.DataLayer do
 
   def can?(resource, :update_query) do
     # We can't currently support updating a record from a query
-    # if that record manages a tenant on update
-    !AshPostgres.DataLayer.Info.manage_tenant_update?(resource)
+    # if that record manages a tenant on update.
+    # Temporal resources (a range-typed member in the composite primary key) are
+    # routed through the non-atomic `update/2` so it can emit `FOR PORTION OF`.
+    is_nil(temporal_period_attribute(resource)) and
+      !AshPostgres.DataLayer.Info.manage_tenant_update?(resource)
   end
 
-  def can?(_, :destroy_query), do: true
+  def can?(resource, :destroy_query), do: is_nil(temporal_period_attribute(resource))
 
   def can?(resource, :update_many) do
     # `update_many` is implemented with a single SQL MERGE, which (with RETURNING + merge_action)
@@ -4009,6 +4012,13 @@ defmodule AshPostgres.DataLayer do
 
   @impl true
   def update(resource, changeset) do
+    case temporal_period_attribute(resource) do
+      nil -> do_update(resource, changeset)
+      period -> for_portion_of_update(resource, changeset, period)
+    end
+  end
+
+  defp do_update(resource, changeset) do
     source = resolve_source(resource, changeset)
 
     query =
@@ -4076,9 +4086,116 @@ defmodule AshPostgres.DataLayer do
     Ecto.Query.where(query, ^pkey)
   end
 
+  # === SQL:2011 application-time temporal support ==========================
+  #
+  # When a resource's COMPOSITE primary key includes a postgres range-typed
+  # attribute (e.g. `daterange`), that attribute names an application-time
+  # period and the rest of the key identifies the entity across its timeline.
+  # Ordinary update/destroy operations are then rewritten to
+  # `UPDATE/DELETE ... FOR PORTION OF`: PostgreSQL clips the matching rows to
+  # the period being written and DB-side inserts any leftover remainder.
+  #
+  # The period bounds come from the period attribute's value on the changeset
+  # (the change for updates, the record for destroys); the SET clause is the
+  # other attribute changes; the WHERE clause is the rest of the primary key.
+
+  defp temporal_period_attribute(resource) do
+    pkey = Ash.Resource.Info.primary_key(resource)
+
+    if length(pkey) > 1 do
+      Enum.find(pkey, &range_pkey_member?(resource, &1))
+    end
+  end
+
+  defp range_pkey_member?(resource, name) do
+    attribute = Ash.Resource.Info.attribute(resource, name)
+    storage_type = Ash.Type.storage_type(attribute.type, attribute.constraints)
+    is_atom(storage_type) and String.ends_with?(to_string(storage_type), "range")
+  end
+
+  defp for_portion_of_update(resource, changeset, period) do
+    {lower, upper} = Ash.Changeset.get_attribute(changeset, period)
+    set_fields = Map.keys(changeset.attributes) -- [period]
+
+    if set_fields == [] do
+      raise ArgumentError,
+            "temporal update for #{inspect(resource)} has no changes outside the #{period} period"
+    end
+
+    {portion_sql, params} = temporal_portion(lower, upper, [lower])
+    {set_sql, params} = temporal_assignments(resource, changeset, set_fields, params)
+    {where_sql, params} = temporal_identity(resource, changeset.data, period, params)
+
+    temporal_repo(resource, changeset).query!(
+      "UPDATE #{table(resource, changeset)} FOR PORTION OF #{period} #{portion_sql} " <>
+        "SET #{set_sql} WHERE #{where_sql}",
+      params
+    )
+
+    Ash.Changeset.apply_attributes(changeset)
+  end
+
+  defp for_portion_of_destroy(resource, changeset, period) do
+    {lower, upper} = Map.get(changeset.data, period)
+    {portion_sql, params} = temporal_portion(lower, upper, [lower])
+    {where_sql, params} = temporal_identity(resource, changeset.data, period, params)
+
+    temporal_repo(resource, changeset).query!(
+      "DELETE FROM #{table(resource, changeset)} FOR PORTION OF #{period} #{portion_sql} " <>
+        "WHERE #{where_sql}",
+      params
+    )
+
+    :ok
+  end
+
+  defp temporal_portion(%Date{}, nil, params),
+    do: {"FROM $#{length(params)}::date TO NULL", params}
+
+  defp temporal_portion(%Date{}, %Date{} = upper, params),
+    do: {"FROM $#{length(params)}::date TO $#{length(params) + 1}::date", params ++ [upper]}
+
+  defp temporal_assignments(resource, changeset, fields, params) do
+    {fragments, params} =
+      Enum.reduce(fields, {[], params}, fn field, {fragments, params} ->
+        value = temporal_dump(resource, field, Ash.Changeset.get_attribute(changeset, field))
+        {fragments ++ ["#{field} = $#{length(params) + 1}"], params ++ [value]}
+      end)
+
+    {Enum.join(fragments, ", "), params}
+  end
+
+  defp temporal_identity(resource, data, period, params) do
+    fields = Ash.Resource.Info.primary_key(resource) -- [period]
+
+    {fragments, params} =
+      Enum.reduce(fields, {[], params}, fn field, {fragments, params} ->
+        value = temporal_dump(resource, field, Map.get(data, field))
+        {fragments ++ ["#{field} = $#{length(params) + 1}"], params ++ [value]}
+      end)
+
+    {Enum.join(fragments, " AND "), params}
+  end
+
+  defp temporal_dump(resource, field, value) do
+    attribute = Ash.Resource.Info.attribute(resource, field)
+    {:ok, dumped} = Ash.Type.dump_to_native(attribute.type, value, attribute.constraints)
+    dumped
+  end
+
+  defp temporal_repo(resource, changeset),
+    do: AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
+
   @impl true
 
-  def destroy(resource, %{data: record} = changeset) do
+  def destroy(resource, changeset) do
+    case temporal_period_attribute(resource) do
+      nil -> do_destroy(resource, changeset)
+      period -> for_portion_of_destroy(resource, changeset, period)
+    end
+  end
+
+  defp do_destroy(resource, %{data: record} = changeset) do
     source = resolve_source(resource, changeset)
 
     query =
