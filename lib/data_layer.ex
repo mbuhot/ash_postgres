@@ -4261,14 +4261,21 @@ defmodule AshPostgres.DataLayer do
     end
   end
 
-  # Builds the entity-key `IN (<subquery>)` clause carrying `changeset.filter` (policy/auth
-  # filters, base/soft-delete filters, attribute-multitenancy scoping, and the optimistic
-  # lock predicate). Reuses the data layer's own query builders so the filter is rendered
-  # exactly as the standard `do_update`/`do_destroy` paths enforce it. Returns `{nil, []}`
-  # when there is no filter and no tenant scoping, so the `IN (...)` clause is omitted.
-  defp filter_subquery(resource, changeset, period, repo) do
+  # Builds a `(<full primary key>) IN (<subquery>)` clause carrying `changeset.filter`
+  # (policy/auth filters, base/soft-delete filters, attribute-multitenancy scoping, and the
+  # optimistic-lock predicate). Reuses the data layer's own query builders so the filter is
+  # rendered exactly as the standard `do_update`/`do_destroy` paths enforce it.
+  #
+  # The correlation key is the FULL primary key — including the period column — so the filter
+  # is evaluated against the exact stored rows `FOR PORTION OF` will clip, not merely against
+  # any period-row sharing the entity key. (A temporal entity holds many non-overlapping
+  # period-rows; correlating on the entity key alone would let a sibling row satisfy the
+  # filter while the clip lands on a non-matching row — a scope/optimistic-lock bypass.)
+  #
+  # Returns `{nil, []}` when there is no filter and no tenant scoping, so the clause is omitted.
+  defp filter_subquery(resource, changeset, _period, repo) do
     if filter_subquery_required?(changeset) do
-      entity_keys = Ash.Resource.Info.primary_key(resource) -- [period]
+      keys = Ash.Resource.Info.primary_key(resource)
       source = resolve_source(resource, changeset)
 
       query =
@@ -4284,12 +4291,12 @@ defmodule AshPostgres.DataLayer do
 
       query =
         query
-        |> Ecto.Query.select([row], map(row, ^entity_keys))
+        |> Ecto.Query.select([row], map(row, ^keys))
         |> Map.delete(:__ash_bindings__)
 
       {sql, params} = repo.to_sql(:all, query)
 
-      columns = Enum.map_join(entity_keys, ", ", &quote_identifier/1)
+      columns = Enum.map_join(keys, ", ", &quote_identifier/1)
       {"(#{columns}) IN (#{sql})", params}
     else
       {nil, []}
@@ -4334,7 +4341,7 @@ defmodule AshPostgres.DataLayer do
   end
 
   defp quote_identifier(name) do
-    ~s("#{name}")
+    ~s(") <> String.replace(to_string(name), ~s("), ~s("")) <> ~s(")
   end
 
   defp qualified_table(resource, changeset) do

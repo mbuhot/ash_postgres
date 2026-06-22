@@ -62,6 +62,33 @@ defmodule AshPostgres.ForPortionOfFilterTest do
     assert versions("acme", "pro") == [{{~D[2026-01-01], nil}, Decimal.new("30.00")}]
   end
 
+  test "filter is correlated to the clipped period-row: a sibling row satisfying the filter does NOT authorize clipping a non-matching row" do
+    # Same entity key (pro/acme), two non-overlapping period-rows: row A satisfies the
+    # `active == true` filter, row B does not.
+    create_rate(code: "pro", owner: "acme", price: "30.00", from: ~D[2026-01-01], to: ~D[2026-06-01], active: true)
+    create_rate(code: "pro", owner: "acme", price: "40.00", from: ~D[2026-06-01], to: nil, active: false)
+
+    rate_b =
+      ContractRate
+      |> Ash.Query.filter(code == "pro" and active == false)
+      |> Ash.read_one!(tenant: "acme")
+
+    # Clipping a portion of row B must NOT be authorized by row A satisfying the filter.
+    assert {:error, %Ash.Error.Invalid{}} =
+             rate_b
+             |> Ash.Changeset.for_update(
+               :change_active_price,
+               %{monthly_price: Decimal.new("99.00"), valid_at: {~D[2026-07-01], nil}},
+               tenant: "acme"
+             )
+             |> Ash.update()
+
+    assert versions("acme", "pro") == [
+             {{~D[2026-01-01], ~D[2026-06-01]}, Decimal.new("30.00")},
+             {{~D[2026-06-01], nil}, Decimal.new("40.00")}
+           ]
+  end
+
   test "an action filter excludes a non-matching row: the temporal destroy does NOT touch it" do
     create_rate(code: "pro", owner: "acme", price: "30.00", from: ~D[2026-01-01], to: nil, active: false)
 

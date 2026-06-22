@@ -67,7 +67,9 @@ defmodule AshPostgres.ForPortionOfSqlTest do
       )
 
     assert statement =~ "IN (SELECT"
-    assert statement =~ ~s|("code", "owner") IN (|
+    # Correlated on the FULL primary key (incl. the period column), not just the entity key,
+    # so the filter is checked against the exact stored row being clipped.
+    assert statement =~ ~s|("code", "valid_at", "owner") IN (|
     assert statement =~ ~s|c0."active"|
 
     assert statement =~ "WHERE (c0.\"active\"::boolean = $1::boolean)"
