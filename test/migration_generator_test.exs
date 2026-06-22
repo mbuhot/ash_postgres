@@ -6816,4 +6816,108 @@ defmodule AshPostgres.MigrationGeneratorTest do
       refute up =~ "references(:referenced_schema_move_authors"
     end
   end
+
+  describe "temporal resources" do
+    test "creates the table without an inline primary key and adds a WITHOUT OVERLAPS primary key",
+         %{
+           snapshot_path: snapshot_path,
+           migration_path: migration_path
+         } do
+      defresource TemporalTierPrice do
+        postgres do
+          table("temporal_tier_prices")
+          repo(AshPostgres.TestRepo)
+          temporal_period(:valid_at)
+        end
+
+        actions do
+          defaults([:create, :read, :update, :destroy])
+        end
+
+        attributes do
+          attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+          attribute(:valid_at, AshPostgres.Test.DateRange,
+            primary_key?: true,
+            allow_nil?: false,
+            public?: true
+          )
+
+          attribute(:monthly_price, :decimal, public?: true)
+        end
+      end
+
+      defdomain([TemporalTierPrice])
+
+      AshPostgres.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [file] =
+               Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs")
+               |> Enum.reject(&String.contains?(&1, "extensions"))
+
+      file_contents = File.read!(file)
+
+      assert file_contents =~ "create table(:temporal_tier_prices, primary_key: false) do"
+
+      refute file_contents =~ "add :code, :text, null: false, primary_key: true"
+      refute file_contents =~ "add :valid_at, :daterange, null: false, primary_key: true"
+
+      assert file_contents =~ "add :code, :text, null: false"
+      assert file_contents =~ "add :valid_at, :daterange, null: false"
+
+      assert file_contents =~
+               ~S[execute("ALTER TABLE \"temporal_tier_prices\" ADD PRIMARY KEY (code, valid_at WITHOUT OVERLAPS)")]
+    end
+
+    test "emits CREATE EXTENSION btree_gist for the repo", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defresource TemporalTierPriceExt do
+        postgres do
+          table("temporal_tier_prices")
+          repo(AshPostgres.TestRepo)
+          temporal_period(:valid_at)
+        end
+
+        actions do
+          defaults([:create, :read, :update, :destroy])
+        end
+
+        attributes do
+          attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+          attribute(:valid_at, AshPostgres.Test.DateRange,
+            primary_key?: true,
+            allow_nil?: false,
+            public?: true
+          )
+        end
+      end
+
+      defdomain([TemporalTierPriceExt])
+
+      AshPostgres.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      extension_migrations =
+        Path.wildcard("#{migration_path}/**/*_extension*.exs")
+        |> Enum.map(&File.read!/1)
+        |> Enum.join("\n")
+
+      assert extension_migrations =~
+               ~S[execute("CREATE EXTENSION IF NOT EXISTS \"btree_gist\"")]
+    end
+  end
 end

@@ -2819,7 +2819,11 @@ defmodule AshPostgres.MigrationGenerator do
 
   defp pkey_operations(snapshot, old_snapshot, attribute_operations, opts) do
     if old_snapshot[:empty?] do
-      {[], attribute_operations}
+      if snapshot[:temporal_period] do
+        temporal_create_pkey_operations(snapshot, attribute_operations)
+      else
+        {[], attribute_operations}
+      end
     else
       must_drop_pkey? =
         Enum.any?(
@@ -2996,6 +3000,42 @@ defmodule AshPostgres.MigrationGenerator do
        ]
        |> Enum.filter(& &1), attribute_operations}
     end
+  end
+
+  # An SQL:2011 temporal table's primary key (`PRIMARY KEY (entity_key..., period WITHOUT
+  # OVERLAPS)`) is not expressible as an inline column option, so it is suppressed on the
+  # created columns and emitted as a dedicated `ADD PRIMARY KEY` statement with the period
+  # column forced last. Dropping the table in the down migration removes the key, so the
+  # operation needs no explicit down.
+  defp temporal_create_pkey_operations(snapshot, attribute_operations) do
+    period = snapshot.temporal_period
+
+    entity_keys =
+      Enum.flat_map(snapshot.attributes, fn attribute ->
+        if attribute.primary_key? && attribute.source != period do
+          [attribute.source]
+        else
+          []
+        end
+      end)
+
+    attribute_operations =
+      Enum.map(attribute_operations, fn
+        %Operation.AddAttribute{attribute: %{primary_key?: true} = attribute} = operation ->
+          %{operation | attribute: %{attribute | primary_key?: false}}
+
+        operation ->
+          operation
+      end)
+
+    {[
+       %Operation.AddPrimaryKey{
+         schema: snapshot.schema,
+         table: snapshot.table,
+         keys: entity_keys,
+         without_overlaps: period
+       }
+     ], attribute_operations}
   end
 
   defp attribute_operations(snapshot, old_snapshot, opts, schema_moves) do
@@ -4124,7 +4164,8 @@ defmodule AshPostgres.MigrationGenerator do
       multitenancy: multitenancy(resource),
       base_filter: AshPostgres.DataLayer.Info.base_filter_sql(resource),
       has_create_action: has_create_action?(resource),
-      create_table_options: AshPostgres.DataLayer.Info.create_table_options(resource)
+      create_table_options: AshPostgres.DataLayer.Info.create_table_options(resource),
+      temporal_period: temporal_period_source(resource)
     }
 
     hash =
@@ -4133,6 +4174,17 @@ defmodule AshPostgres.MigrationGenerator do
       |> Base.encode16()
 
     Map.put(snapshot, :hash, hash)
+  end
+
+  defp temporal_period_source(resource) do
+    case AshPostgres.DataLayer.Info.temporal_period(resource) do
+      nil ->
+        nil
+
+      period ->
+        attribute = Ash.Resource.Info.attribute(resource, period)
+        attribute.source || attribute.name
+    end
   end
 
   defp has_create_action?(resource) do
@@ -4688,6 +4740,8 @@ defmodule AshPostgres.MigrationGenerator do
     |> Map.update!(:multitenancy, &load_multitenancy/1)
     |> Map.put_new(:base_filter, nil)
     |> Map.put_new(:drop_table_opted_out, false)
+    |> Map.put_new(:temporal_period, nil)
+    |> Map.update!(:temporal_period, &maybe_to_atom/1)
   end
 
   defp load_check_constraints(constraints) do

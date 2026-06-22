@@ -1211,10 +1211,16 @@ defmodule AshPostgres.MigrationGenerator.Operation do
 
   defmodule AddPrimaryKey do
     @moduledoc false
-    defstruct [:schema, :table, :keys, no_phase: true]
+    defstruct [:schema, :table, :keys, :without_overlaps, no_phase: true]
 
-    def up(%{schema: schema, table: table, keys: keys, multitenancy: multitenancy}) do
-      keys = Enum.join(keys, ", ")
+    def up(%{
+          schema: schema,
+          table: table,
+          keys: keys,
+          without_overlaps: without_overlaps,
+          multitenancy: multitenancy
+        }) do
+      keys = key_list(keys, without_overlaps)
 
       cond do
         multitenancy.strategy == :context ->
@@ -1236,6 +1242,12 @@ defmodule AshPostgres.MigrationGenerator.Operation do
 
     def down(_) do
       ""
+    end
+
+    defp key_list(keys, nil), do: Enum.join(keys, ", ")
+
+    defp key_list(keys, without_overlaps) do
+      Enum.join(keys ++ ["#{without_overlaps} WITHOUT OVERLAPS"], ", ")
     end
   end
 

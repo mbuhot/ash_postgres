@@ -43,20 +43,37 @@ defmodule AshPostgres.Verifiers.ValidateTemporalPeriod do
         )
 
       true ->
-        maybe_warn_migrate(dsl, period)
+        validate_btree_gist(dsl, period)
     end
   end
 
-  # The migration generator can't emit `WITHOUT OVERLAPS`, so a generated migration for a
-  # temporal resource would be wrong. Steer the user to a hand-written migration.
-  defp maybe_warn_migrate(dsl, period) do
-    if Verifier.get_option(dsl, [:postgres], :migrate?) do
-      {:warn,
-       "`temporal_period #{inspect(period)}` is set with `migrate? true`, but the migration " <>
-         "generator cannot emit a `WITHOUT OVERLAPS` primary key. Set `migrate? false` and " <>
-         "hand-write the table's temporal DDL."}
+  # The generated `WITHOUT OVERLAPS` primary key is backed by a GiST exclusion constraint,
+  # which requires the `btree_gist` extension. When the resource is migratable, the repo must
+  # list `"btree_gist"` in `installed_extensions/0` so the extensions migration installs it.
+  defp validate_btree_gist(dsl, period) do
+    if Verifier.get_option(dsl, [:postgres], :migrate?) && !btree_gist_installed?(dsl) do
+      error(
+        dsl,
+        "`temporal_period #{inspect(period)}` requires the `btree_gist` PostgreSQL extension " <>
+          "for its `WITHOUT OVERLAPS` primary key. Add `\"btree_gist\"` to your repo's " <>
+          "`installed_extensions/0`, or set `migrate? false` to manage the table's DDL yourself"
+      )
     else
       :ok
+    end
+  end
+
+  # The repo can be configured as a function `(resource, type) -> repo`, in which case its
+  # extensions cannot be determined statically; only enforce the requirement for a plain repo
+  # module that exports `installed_extensions/0`.
+  defp btree_gist_installed?(dsl) do
+    repo = Verifier.get_option(dsl, [:postgres], :repo)
+
+    if is_atom(repo) && Code.ensure_loaded?(repo) &&
+         function_exported?(repo, :installed_extensions, 0) do
+      "btree_gist" in repo.installed_extensions()
+    else
+      true
     end
   end
 

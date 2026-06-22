@@ -23,7 +23,8 @@ defmodule AshPostgres.TestRepo do
       "citext",
       AshPostgres.TestCustomExtension,
       AshPostgres.Extensions.ImmutableRaiseError,
-      "ltree"
+      "ltree",
+      "btree_gist"
     ] --
       Application.get_env(:ash_postgres, :no_extensions, [])
   end
