@@ -37,7 +37,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
     assert statement =~ ~s|WHERE "code" = $|
     assert statement =~ "RETURNING"
 
-    assert [~D[2026-06-16], %Decimal{}, "pro"] = params
+    assert [~D[2026-06-16], "pro", %Decimal{}] = params
   end
 
   test "a non-empty filter embeds the entity-key IN(subquery), ANDed with the key equality" do

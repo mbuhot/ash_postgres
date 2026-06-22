@@ -42,6 +42,14 @@ defmodule AshPostgres.ForPortionOfFilterTest do
     |> Enum.map(&{&1.valid_at, &1.monthly_price})
   end
 
+  defp slices(owner, code) do
+    ContractRate
+    |> Ash.Query.filter(code == ^code)
+    |> Ash.Query.sort(valid_at: :asc)
+    |> Ash.read!(tenant: owner)
+    |> Enum.map(&{&1.valid_at, &1.monthly_price, &1.version})
+  end
+
   test "an action filter excludes a non-matching row: the temporal update does NOT touch it" do
     create_rate(code: "pro", owner: "acme", price: "30.00", from: ~D[2026-01-01], to: nil, active: false)
 
@@ -168,9 +176,31 @@ defmodule AshPostgres.ForPortionOfFilterTest do
     )
     |> Ash.update!()
 
-    assert versions("acme", "pro") == [
-             {{~D[2026-01-01], ~D[2026-06-16]}, Decimal.new("30.00")},
-             {{~D[2026-06-16], nil}, Decimal.new("60.00")}
+    assert slices("acme", "pro") == [
+             {{~D[2026-01-01], ~D[2026-06-16]}, Decimal.new("30.00"), 1},
+             {{~D[2026-06-16], nil}, Decimal.new("60.00"), 2}
+           ]
+  end
+
+  test "an explicit atomic_update is applied to the clipped portion, not silently dropped" do
+    create_rate(code: "pro", owner: "acme", price: "30.00", from: ~D[2026-01-01], to: nil, version: 1)
+
+    rate =
+      ContractRate
+      |> Ash.Query.filter(code == "pro")
+      |> Ash.read_one!(tenant: "acme")
+
+    rate
+    |> Ash.Changeset.for_update(
+      :bump_version,
+      %{monthly_price: Decimal.new("60.00"), valid_at: {~D[2026-06-16], nil}},
+      tenant: "acme"
+    )
+    |> Ash.update!()
+
+    assert slices("acme", "pro") == [
+             {{~D[2026-01-01], ~D[2026-06-16]}, Decimal.new("30.00"), 1},
+             {{~D[2026-06-16], nil}, Decimal.new("60.00"), 2}
            ]
   end
 

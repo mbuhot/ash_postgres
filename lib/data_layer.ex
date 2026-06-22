@@ -4152,18 +4152,12 @@ defmodule AshPostgres.DataLayer do
 
   @doc false
   # Assembles the `UPDATE ... FOR PORTION OF ... RETURNING` statement and its ordered
-  # parameter list. Parameter ordering is `subquery_params ++ [from, to] ++ set_values ++
-  # entity_key_values`, so the embedded filter subquery keeps its native `$1..$k` and the
-  # hand-built clauses reference `$k+1 ...` (no placeholder rewriting). Exposed for unit
-  # testing the (no-)filter SQL shape without a database round trip.
+  # parameter list. Parameter ordering is `subquery_params ++ [from, to] ++ entity_key_values
+  # ++ set_params`, so the embedded filter subquery keeps its native `$1..$k`, the hand-built
+  # clauses reference `$k+1 ...`, and the Ecto-rendered SET fragment's placeholders are shifted
+  # to trail them all. Exposed for unit testing the (no-)filter SQL shape without a database
+  # round trip.
   def build_for_portion_of_update(resource, changeset, period, repo) do
-    set = Map.delete(storage_changes(resource, changeset, repo), period)
-
-    if set == %{} do
-      raise ArgumentError,
-            "temporal update for #{inspect(resource)} has no changes outside the #{period} period"
-    end
-
     {filter_sql, subquery_params} = filter_subquery(resource, changeset, period, repo)
 
     {portion_sql, params} =
@@ -4173,8 +4167,8 @@ defmodule AshPostgres.DataLayer do
         subquery_params
       )
 
-    {set_sql, params} = set_clause(set, params)
     {where_sql, params} = identity_clause(resource, changeset.data, period, filter_sql, params)
+    {set_sql, params} = set_clause(resource, changeset, period, repo, params)
 
     {returning_sql, columns} = returning_clause(resource)
 
@@ -4382,13 +4376,84 @@ defmodule AshPostgres.DataLayer do
     end
   end
 
-  defp set_clause(changes, params) do
-    {fragments, params} =
-      Enum.reduce(changes, {[], params}, fn {column, value}, {fragments, params} ->
-        {fragments ++ ["#{quote_identifier(column)} = $#{length(params) + 1}"], params ++ [value]}
-      end)
+  # Renders the SET clause — static attribute changes and `changeset.atomics` (e.g. an
+  # `atomic_update`/counter expression) together — by reusing `AshSql.Atomics.query_with_atomics`,
+  # the same renderer the ordinary (atomic) update path uses, then adapting its output for the
+  # alias-free `FOR PORTION OF` statement.
+  #
+  # WORKAROUND: PostgreSQL does not permit a table alias on the target of an
+  # `UPDATE ... FOR PORTION OF` (`UPDATE t AS x FOR PORTION OF ...` is a syntax error), but Ecto
+  # always renders an UPDATE's SET with the source qualified (`x0."col"`). Because we cannot ask
+  # Ecto for an unqualified render, we render normally via `to_sql/2` and then strip the
+  # qualifier from the SET fragment. In an unaliased UPDATE the bare `"col"` already denotes the
+  # matched row's current value, so `"col" = "col" + $n` is exactly the increment we want.
+  #
+  # The de-qualification is safe and deterministic:
+  #   * `filter: nil` + no joins makes `to_sql(:update_all)` emit exactly
+  #     `UPDATE <table> AS <alias> SET <frag>` with no trailing WHERE/FROM, so `<frag>` is the
+  #     whole tail and the alias is the single `AS <alias>` token before ` SET `.
+  #   * Params are `$n` placeholders (data is never inlined), so `<alias>.` only ever appears as
+  #     a column qualifier — never inside a literal.
+  #   * The fragment's native `$1..$m` are shifted past the params already accumulated, and its
+  #     params appended last (the same positional-param composition `filter_subquery/4` uses).
+  #
+  # Only atomics over the resource's own columns are supported. Atomics referencing aggregates or
+  # relationships make `query_with_atomics` emit joins/subqueries (with their own aliases) that
+  # de-qualification would corrupt; those are detected and refused rather than mis-rendered.
+  defp set_clause(resource, changeset, period, repo, params) do
+    changes = Map.delete(storage_changes(resource, changeset, repo), period)
 
-    {Enum.join(fragments, ", "), params}
+    query =
+      from(row in resolve_source(resource, changeset), as: ^0)
+      |> AshSql.Bindings.default_bindings(
+        resource,
+        AshPostgres.SqlImplementation,
+        changeset.context
+      )
+
+    case AshSql.Atomics.query_with_atomics(resource, query, nil, changeset.atomics, changes, []) do
+      {:empty, _query} ->
+        raise ArgumentError,
+              "temporal update for #{inspect(resource)} has no changes outside the #{period} period"
+
+      {:ok, query} ->
+        {sql, set_params} = repo.to_sql(:update_all, Map.delete(query, :__ash_bindings__))
+
+        [header, fragment] = String.split(sql, " SET ", parts: 2)
+
+        fragment = dequalify_set(fragment, header, resource)
+
+        {shift_placeholders(fragment, length(params)), params ++ set_params}
+
+      {:error, error} ->
+        raise ArgumentError,
+              "temporal update for #{inspect(resource)} could not render atomics into an " <>
+                "alias-free SET clause (atomics referencing aggregates or relationships are " <>
+                "unsupported): #{inspect(error)}"
+    end
+  end
+
+  # Strips the table-source qualifier Ecto added (`<alias>.`) from a rendered SET fragment so it
+  # is valid inside `FOR PORTION OF`. See `set_clause/5` for why this is required and safe.
+  defp dequalify_set(fragment, header, resource) do
+    if String.contains?(fragment, [" FROM ", "(SELECT"]) do
+      raise ArgumentError,
+            "temporal update for #{inspect(resource)} renders a subquery/join in its SET clause " <>
+              "(atomics referencing aggregates or relationships are unsupported in FOR PORTION OF)"
+    end
+
+    case Regex.run(~r/ AS (\w+)$/, header) do
+      [_, source_alias] -> String.replace(fragment, source_alias <> ".", "")
+      nil -> fragment
+    end
+  end
+
+  defp shift_placeholders(sql, 0), do: sql
+
+  defp shift_placeholders(sql, offset) do
+    Regex.replace(~r/\$(\d+)/, sql, fn _, digits ->
+      "$#{String.to_integer(digits) + offset}"
+    end)
   end
 
   defp identity_clause(resource, data, period, filter_sql, params) do

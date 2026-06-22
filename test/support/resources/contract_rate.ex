@@ -58,6 +58,11 @@ defmodule AshPostgres.Test.ContractRate do
       change optimistic_lock(:version)
     end
 
+    update :bump_version do
+      accept [:monthly_price, :valid_at]
+      change atomic_update(:version, expr(version + 1))
+    end
+
     destroy :destroy
 
     destroy :destroy_active do
