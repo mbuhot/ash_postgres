@@ -70,6 +70,60 @@ defmodule AshPostgres.ForPortionOfTest do
     assert versions("pro") == [{{~D[2026-01-01], ~D[2026-06-16]}, Decimal.new("30.00")}]
   end
 
+  test "an update over a bounded interior portion splits the row three ways" do
+    create_price("pro", "30.00", ~D[2026-01-01], ~D[2027-01-01])
+
+    active_version("pro")
+    |> Ash.Changeset.for_update(:change_price, %{
+      monthly_price: Decimal.new("60.00"),
+      valid_at: {~D[2026-04-01], ~D[2026-07-01]}
+    })
+    |> Ash.update!()
+
+    assert versions("pro") == [
+             {{~D[2026-01-01], ~D[2026-04-01]}, Decimal.new("30.00")},
+             {{~D[2026-04-01], ~D[2026-07-01]}, Decimal.new("60.00")},
+             {{~D[2026-07-01], ~D[2027-01-01]}, Decimal.new("30.00")}
+           ]
+  end
+
+  test "a destroy over a bounded interior portion leaves the two remainders with a gap" do
+    create_price("pro", "30.00", ~D[2026-01-01], ~D[2027-01-01])
+
+    %{active_version("pro") | valid_at: {~D[2026-04-01], ~D[2026-07-01]}}
+    |> Ash.Changeset.for_destroy(:destroy)
+    |> Ash.destroy!()
+
+    assert versions("pro") == [
+             {{~D[2026-01-01], ~D[2026-04-01]}, Decimal.new("30.00")},
+             {{~D[2026-07-01], ~D[2027-01-01]}, Decimal.new("30.00")}
+           ]
+  end
+
+  test "clipping a sub-portion of one period-row leaves sibling rows untouched" do
+    create_price("pro", "10.00", ~D[2026-01-01], ~D[2026-04-01])
+    create_price("pro", "20.00", ~D[2026-04-01], ~D[2026-07-01])
+    create_price("pro", "30.00", ~D[2026-07-01], nil)
+
+    TierPrice
+    |> Ash.Query.filter(code == "pro")
+    |> Ash.Query.filter(valid_at == ^{~D[2026-04-01], ~D[2026-07-01]})
+    |> Ash.read_one!()
+    |> Ash.Changeset.for_update(:change_price, %{
+      monthly_price: Decimal.new("25.00"),
+      valid_at: {~D[2026-05-01], ~D[2026-06-01]}
+    })
+    |> Ash.update!()
+
+    assert versions("pro") == [
+             {{~D[2026-01-01], ~D[2026-04-01]}, Decimal.new("10.00")},
+             {{~D[2026-04-01], ~D[2026-05-01]}, Decimal.new("20.00")},
+             {{~D[2026-05-01], ~D[2026-06-01]}, Decimal.new("25.00")},
+             {{~D[2026-06-01], ~D[2026-07-01]}, Decimal.new("20.00")},
+             {{~D[2026-07-01], nil}, Decimal.new("30.00")}
+           ]
+  end
+
   defp create_booking(room, status, from, to) do
     RoomBooking
     |> Ash.Changeset.for_create(:create, %{room: room, status: status, period: {from, to}})
