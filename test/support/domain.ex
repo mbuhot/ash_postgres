@@ -14,6 +14,7 @@ defmodule AshPostgres.Test.Domain do
     end
 
     resource(AshPostgres.Test.Comedian)
+    resource(AshPostgres.Test.TierPrice)
     resource(AshPostgres.Test.Comment)
     resource(AshPostgres.Test.CommentLink)
     resource(AshPostgres.Test.IntegerPost)
