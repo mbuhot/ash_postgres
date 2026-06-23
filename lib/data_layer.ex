@@ -2656,15 +2656,9 @@ defmodule AshPostgres.DataLayer do
         nil
       end
 
-    savepoint_query = %{
-      __ash_bindings__: %{
-        expression_accumulator: %AshSql.Expr.ExprInfo{has_error?: true}
-      }
-    }
-
     try do
       results =
-        with_savepoint(repo, savepoint_query, fn ->
+        with_savepoint(repo, savepoint_sentinel(), fn ->
           Enum.map(changesets, fn changeset ->
             temporal_upsert_one(resource, changeset, period, source, repo, opts, returning)
           end)
@@ -2914,6 +2908,16 @@ defmodule AshPostgres.DataLayer do
         {[{field, dynamic} | set_values], [present_column | present_columns]}
       end
     end)
+  end
+
+  # The FOR PORTION OF paths run hand-built `repo.query!` statements that bypass the query
+  # pipeline, but must still execute inside a savepoint so a constraint violation rolls back
+  # cleanly and translates to an `Ash.Error`. `with_savepoint/3` decides whether to open a
+  # savepoint by reading `query.__ash_bindings__.expression_accumulator.has_error?`; there is no
+  # real query here, so this is the minimal query-shaped value that forces that branch. Centralises
+  # the fabricated shape so both call sites stay in sync with what `with_savepoint/3` matches on.
+  defp savepoint_sentinel do
+    %{__ash_bindings__: %{expression_accumulator: %AshSql.Expr.ExprInfo{has_error?: true}}}
   end
 
   defp with_savepoint(
@@ -4630,15 +4634,9 @@ defmodule AshPostgres.DataLayer do
       |> Map.update!(:__meta__, &Map.put(&1, :source, table(resource, changeset)))
       |> ecto_changeset(changeset, action, repo, true)
 
-    savepoint_query = %{
-      __ash_bindings__: %{
-        expression_accumulator: %AshSql.Expr.ExprInfo{has_error?: true}
-      }
-    }
-
     try do
       result =
-        with_savepoint(repo, savepoint_query, fn ->
+        with_savepoint(repo, savepoint_sentinel(), fn ->
           repo.query!(statement, params)
         end)
 
