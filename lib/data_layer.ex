@@ -694,13 +694,20 @@ defmodule AshPostgres.DataLayer do
   def can?(resource, :update_query) do
     # We can't currently support updating a record from a query
     # if that record manages a tenant on update.
-    # Temporal resources (a range-typed member in the composite primary key) are
-    # routed through the non-atomic `update/2` so it can emit `FOR PORTION OF`.
-    is_nil(temporal_period_attribute(resource)) and
-      !AshPostgres.DataLayer.Info.manage_tenant_update?(resource)
+    #
+    # Temporal resources support the query path: a whole-row temporal update (the changeset
+    # leaves the period alone) is a plain atomic `UPDATE`. A period-changing clip is diverted
+    # inside `update_query/4` to the bespoke `FOR PORTION OF` statement.
+    !AshPostgres.DataLayer.Info.manage_tenant_update?(resource)
   end
 
-  def can?(resource, :destroy_query), do: is_nil(temporal_period_attribute(resource))
+  # Temporal resources support the query path. A single-record destroy carries the loaded
+  # snapshot in `changeset.data`, whose period is the asserted portion: `destroy_query/4`
+  # diverts it to a `FOR PORTION OF` statement, which uniformly handles a whole-row delete
+  # (the snapshot's full period) and a clip (a narrowed `valid_at`). A bulk/query destroy has
+  # no per-record snapshot (`changeset.data` is `OriginalDataNotAvailable`) and never clips —
+  # it falls through to a plain atomic `DELETE` of the whole rows matching the query.
+  def can?(_, :destroy_query), do: true
 
   def can?(resource, :update_many) do
     # `update_many` is implemented with a single SQL MERGE, which (with RETURNING + merge_action)
@@ -1778,6 +1785,48 @@ defmodule AshPostgres.DataLayer do
 
   @impl true
   def update_query(query, changeset, resource, options) do
+    case temporal_clip_query_update(query, resource, changeset, options) do
+      :fallthrough -> do_update_query(query, changeset, resource, options)
+      result -> result
+    end
+  end
+
+  # A period-changing temporal update is a clip: it must become a `FOR PORTION OF` statement,
+  # not a plain `update_all` over the query's PK filter. Returns the `update_query/4`-shaped
+  # result for a clip, or `:fallthrough` to run the normal atomic `UPDATE` (whole-row temporal
+  # update or non-temporal resource).
+  #
+  # A single-record atomic update (the common per-record path, including the atomic upgrade of
+  # one record) carries the loaded snapshot in `changeset.data`, so the clip is scoped to that
+  # one entity via its entity key. A bulk atomic update (`Ash.bulk_update` over a query) has no
+  # per-record snapshot (`changeset.data` is `OriginalDataNotAvailable`); its clip is scoped by
+  # the bulk query's filter, which clips every matching period-row independently.
+  defp temporal_clip_query_update(query, resource, changeset, options) do
+    case temporal_clip_period(resource, changeset) do
+      nil ->
+        :fallthrough
+
+      period when is_struct(changeset.data, Ash.Changeset.OriginalDataNotAvailable) ->
+        case for_portion_of_bulk_update(query, resource, changeset, period) do
+          {:ok, records} -> if options[:return_records?], do: {:ok, records}, else: :ok
+          other -> other
+        end
+
+      period ->
+        case for_portion_of_update(resource, changeset, period) do
+          {:ok, record} ->
+            if options[:return_records?], do: {:ok, [record]}, else: :ok
+
+          {:error, %Ash.Error.Changes.StaleRecord{}} ->
+            if options[:return_records?], do: {:ok, []}, else: :ok
+
+          other ->
+            other
+        end
+    end
+  end
+
+  defp do_update_query(query, changeset, resource, options) do
     repo = AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
 
     ecto_changeset =
@@ -2098,6 +2147,41 @@ defmodule AshPostgres.DataLayer do
 
   @impl true
   def destroy_query(query, changeset, resource, options) do
+    case temporal_clip_query_destroy(resource, changeset, options) do
+      :fallthrough -> do_destroy_query(query, changeset, resource, options)
+      result -> result
+    end
+  end
+
+  # A single-record temporal destroy carries the loaded snapshot in `changeset.data`, whose
+  # period is the asserted portion: it is diverted to a `FOR PORTION OF` statement, which
+  # handles a whole-row delete (the snapshot's full period) and a clip (a narrowed `valid_at`)
+  # uniformly. A bulk/query destroy has no per-record snapshot (`changeset.data` is
+  # `OriginalDataNotAvailable`) and never clips — it falls through to a plain atomic `DELETE`
+  # of the whole rows matching the query.
+  defp temporal_clip_query_destroy(resource, changeset, options) do
+    case temporal_period_attribute(resource) do
+      nil ->
+        :fallthrough
+
+      _period when is_struct(changeset.data, Ash.Changeset.OriginalDataNotAvailable) ->
+        :fallthrough
+
+      period ->
+        case for_portion_of_destroy(resource, changeset, period) do
+          :ok ->
+            if options[:return_records?], do: {:ok, [changeset.data]}, else: :ok
+
+          {:error, %Ash.Error.Changes.StaleRecord{}} ->
+            if options[:return_records?], do: {:ok, []}, else: :ok
+
+          other ->
+            other
+        end
+    end
+  end
+
+  defp do_destroy_query(query, changeset, resource, options) do
     repo = AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
 
     ecto_changeset =
@@ -4034,7 +4118,7 @@ defmodule AshPostgres.DataLayer do
 
   @impl true
   def update(resource, changeset) do
-    case temporal_period_attribute(resource) do
+    case temporal_clip_period(resource, changeset) do
       nil -> do_update(resource, changeset)
       period -> for_portion_of_update(resource, changeset, period)
     end
@@ -4131,6 +4215,19 @@ defmodule AshPostgres.DataLayer do
     AshPostgres.DataLayer.Info.temporal_period(resource)
   end
 
+  # The asserted portion of a temporal update is the period attribute's value on the changeset,
+  # which defaults to the snapshot's own period. A changeset that *changes* the period asserts a
+  # different portion than the row holds — a clip — and must be rewritten to `FOR PORTION OF`. A
+  # changeset that leaves the period alone asserts the row's exact full period, which is an
+  # ordinary whole-row `UPDATE` routed through the normal `do_update/2` path. Returns the period
+  # attribute name when the resource is temporal and the changeset clips it, else nil.
+  defp temporal_clip_period(resource, changeset) do
+    case temporal_period_attribute(resource) do
+      nil -> nil
+      period -> if Ash.Changeset.changing_attribute?(changeset, period), do: period
+    end
+  end
+
   defp for_portion_of_update(resource, changeset, period) do
     repo = AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
     {statement, params, columns} = build_for_portion_of_update(resource, changeset, period, repo)
@@ -4156,6 +4253,68 @@ defmodule AshPostgres.DataLayer do
       {:error, :no_rollback, error} ->
         {:error, :no_rollback, error}
     end
+  end
+
+  # A bulk atomic update clips every period-row matched by the bulk query, with no per-record
+  # snapshot to scope an entity key by. The `FOR PORTION OF` statement's `WHERE` is therefore a
+  # `(pk) IN (<bulk query>)` membership test, so PostgreSQL clips each matching row independently
+  # — the same per-row clipping the streamed per-record path produces. Returns all resulting
+  # slices (one per affected row) so `update_query/4` can hand back every record.
+  defp for_portion_of_bulk_update(query, resource, changeset, period) do
+    repo = AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
+
+    {statement, params, columns} =
+      build_for_portion_of_bulk_update(query, resource, changeset, period, repo)
+
+    case run_for_portion_of(repo, changeset, resource, :update, statement, params) do
+      {:ok, result} ->
+        {:ok, load_returned_records(resource, columns, result)}
+
+      {:error, error} ->
+        {:error, error}
+
+      {:error, :no_rollback, error} ->
+        {:error, :no_rollback, error}
+    end
+  end
+
+  defp build_for_portion_of_bulk_update(query, resource, changeset, period, repo) do
+    {where_sql, subquery_params} = bulk_membership_clause(query, resource, repo)
+
+    {portion_sql, params} =
+      period_bounds(
+        Ash.Changeset.get_attribute(changeset, period),
+        subtype(resource, period),
+        subquery_params
+      )
+
+    {set_sql, params} = set_clause(resource, changeset, period, repo, params)
+
+    {returning_sql, columns} = returning_clause(resource)
+
+    statement =
+      "UPDATE #{qualified_table(resource, changeset)} FOR PORTION OF #{quote_identifier(storage_name(resource, period))} #{portion_sql} " <>
+        "SET #{set_sql} WHERE #{where_sql} RETURNING #{returning_sql}"
+
+    {statement, params, columns}
+  end
+
+  # Renders the bulk query as a `(pk) IN (SELECT pk ... WHERE <bulk filter>)` membership clause,
+  # so the `FOR PORTION OF` statement clips exactly the rows the bulk query selected.
+  defp bulk_membership_clause(query, resource, repo) do
+    keys = Ash.Resource.Info.primary_key(resource)
+
+    select_query =
+      query
+      |> Ecto.Query.exclude(:select)
+      |> Ecto.Query.select([row], map(row, ^keys))
+      |> Map.delete(:__ash_bindings__)
+
+    {sql, params} = repo.to_sql(:all, select_query)
+
+    columns = Enum.map_join(keys, ", ", &quote_identifier(storage_name(resource, &1)))
+
+    {"(#{columns}) IN (#{sql})", params}
   end
 
   @doc false
@@ -4346,7 +4505,10 @@ defmodule AshPostgres.DataLayer do
     end)
   end
 
-  defp period_lower({lower, _upper}), do: lower
+  defp period_lower(%Postgrex.Range{lower: lower}), do: unbound_to_nil(lower)
+
+  defp unbound_to_nil(:unbound), do: nil
+  defp unbound_to_nil(value), do: value
 
   defp lower_before?(nil, _other), do: true
   defp lower_before?(_lower, nil), do: false
@@ -4410,7 +4572,10 @@ defmodule AshPostgres.DataLayer do
   # Reuse the data layer's own dumping: build the Ecto changeset a normal update would
   # use, whose `.changes` is the attribute => dumped-native-value map.
   defp storage_changes(resource, changeset, repo) do
-    changeset.data
+    case changeset.data do
+      %Ash.Changeset.OriginalDataNotAvailable{} -> changeset.resource.__struct__()
+      data -> data
+    end
     |> Map.update!(:__meta__, &Map.put(&1, :source, table(resource, changeset)))
     |> ecto_changeset(changeset, :update, repo, true)
     |> Map.fetch!(:changes)
@@ -4418,7 +4583,9 @@ defmodule AshPostgres.DataLayer do
 
   # The FROM/TO bounds need an explicit cast to the range's subtype: a bare parameter
   # in `FROM $1 TO NULL` is ambiguous to PostgreSQL.
-  defp period_bounds({lower, upper}, subtype, params) do
+  defp period_bounds(%Postgrex.Range{lower: lower, upper: upper}, subtype, params) do
+    lower = unbound_to_nil(lower)
+    upper = unbound_to_nil(upper)
     params = params ++ [lower]
     from_sql = "FROM $#{length(params)}::#{subtype}"
 

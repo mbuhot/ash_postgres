@@ -5,8 +5,12 @@
 defmodule AshPostgres.TemporalDetectionTest do
   @moduledoc """
   Temporal behaviour is opt-in via `temporal_period`, not inferred. A composite primary
-  key that merely contains a range-typed member is an ordinary resource. No database
-  needed — these assert the data layer's capability reporting.
+  key that merely contains a range-typed member is an ordinary resource. A temporal
+  resource supports the `update_query` and `destroy_query` paths: a whole-row update/destroy
+  is an ordinary atomic statement and a single-record period clip is diverted to
+  `FOR PORTION OF` inside `update_query/4` / `destroy_query/4`. Bulk update (`update_many`)
+  stays off the query path so it falls back to the per-record callback that emits
+  `FOR PORTION OF`. No database needed; these assert the data layer's capability reporting.
   """
   use ExUnit.Case, async: true
 
@@ -51,10 +55,10 @@ defmodule AshPostgres.TemporalDetectionTest do
     end
   end
 
-  test "a declared temporal resource is routed off every query/many mutation path (so it can emit FOR PORTION OF)" do
+  test "a declared temporal resource supports the update_query and destroy_query paths but not update_many" do
     assert AshPostgres.DataLayer.Info.temporal_period(Declared) == :valid_at
-    refute AshPostgres.DataLayer.can?(Declared, :update_query)
-    refute AshPostgres.DataLayer.can?(Declared, :destroy_query)
+    assert AshPostgres.DataLayer.can?(Declared, :update_query)
+    assert AshPostgres.DataLayer.can?(Declared, :destroy_query)
     refute AshPostgres.DataLayer.can?(Declared, :update_many)
   end
 

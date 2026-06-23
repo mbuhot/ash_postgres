@@ -30,6 +30,21 @@ defmodule AshPostgres.ForPortionOfTest do
     |> Ash.create!()
   end
 
+  defp to_bounds(%Postgrex.Range{lower: lower, upper: upper}),
+    do: {unbound_to_nil(lower), unbound_to_nil(upper)}
+
+  defp unbound_to_nil(:unbound), do: nil
+  defp unbound_to_nil(value), do: value
+
+  defp range({lower, upper}) do
+    %Postgrex.Range{
+      lower: lower || :unbound,
+      lower_inclusive: true,
+      upper: upper || :unbound,
+      upper_inclusive: false
+    }
+  end
+
   defp active_version(code) do
     TierPrice
     |> Ash.Query.filter(code == ^code)
@@ -41,7 +56,7 @@ defmodule AshPostgres.ForPortionOfTest do
     |> Ash.Query.filter(code == ^code)
     |> Ash.Query.sort(valid_at: :asc)
     |> Ash.read!()
-    |> Enum.map(&{&1.valid_at, &1.monthly_price})
+    |> Enum.map(&{to_bounds(&1.valid_at), &1.monthly_price})
   end
 
   test "a plain update over a period splits the row into old- and new-value slices" do
@@ -60,10 +75,92 @@ defmodule AshPostgres.ForPortionOfTest do
            ]
   end
 
+  test "an update that does not change the period is a whole-row atomic UPDATE, not a FOR PORTION OF clip" do
+    create_price("pro", "30.00", ~D[2026-01-01], nil)
+
+    updated =
+      active_version("pro")
+      |> Ash.Changeset.for_update(:set_price, %{monthly_price: Decimal.new("45.00")})
+      |> Ash.update!()
+
+    assert to_bounds(updated.valid_at) == {~D[2026-01-01], nil}
+    assert updated.monthly_price == Decimal.new("45.00")
+
+    assert versions("pro") == [{{~D[2026-01-01], nil}, Decimal.new("45.00")}]
+  end
+
+  test "a whole-row update runs atomically (require_atomic? true) without raising MustBeAtomic" do
+    create_price("pro", "30.00", ~D[2026-01-01], nil)
+
+    assert true == Ash.Resource.Info.action(TierPrice, :set_price).require_atomic?
+
+    active_version("pro")
+    |> Ash.Changeset.for_update(:set_price, %{monthly_price: Decimal.new("45.00")})
+    |> Ash.update!()
+
+    assert versions("pro") == [{{~D[2026-01-01], nil}, Decimal.new("45.00")}]
+  end
+
+  defp capture_update_sql(fun) do
+    test_pid = self()
+    handler_id = {__MODULE__, make_ref()}
+
+    :telemetry.attach(
+      handler_id,
+      [:ash_postgres, :test_repo, :query],
+      fn _event, _measurements, %{query: query}, _config ->
+        if query =~ "UPDATE", do: send(test_pid, {:sql, query})
+      end,
+      nil
+    )
+
+    try do
+      fun.()
+    after
+      :telemetry.detach(handler_id)
+    end
+
+    collect_sql([])
+  end
+
+  defp collect_sql(acc) do
+    receive do
+      {:sql, query} -> collect_sql([query | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  test "a whole-row update emits a plain UPDATE while a clip emits FOR PORTION OF" do
+    create_price("pro", "30.00", ~D[2026-01-01], nil)
+
+    whole_row_sql =
+      capture_update_sql(fn ->
+        active_version("pro")
+        |> Ash.Changeset.for_update(:set_price, %{monthly_price: Decimal.new("45.00")})
+        |> Ash.update!()
+      end)
+
+    assert Enum.any?(whole_row_sql, &(&1 =~ "UPDATE"))
+    refute Enum.any?(whole_row_sql, &(&1 =~ "FOR PORTION OF"))
+
+    clip_sql =
+      capture_update_sql(fn ->
+        active_version("pro")
+        |> Ash.Changeset.for_update(:change_price, %{
+          monthly_price: Decimal.new("60.00"),
+          valid_at: {~D[2026-06-16], nil}
+        })
+        |> Ash.update!()
+      end)
+
+    assert Enum.any?(clip_sql, &(&1 =~ "FOR PORTION OF"))
+  end
+
   test "a plain destroy over a period clips the row, leaving the earlier portion" do
     create_price("pro", "30.00", ~D[2026-01-01], nil)
 
-    %{active_version("pro") | valid_at: {~D[2026-06-16], nil}}
+    %{active_version("pro") | valid_at: range({~D[2026-06-16], nil})}
     |> Ash.Changeset.for_destroy(:destroy)
     |> Ash.destroy!()
 
@@ -90,7 +187,7 @@ defmodule AshPostgres.ForPortionOfTest do
   test "a destroy over a bounded interior portion leaves the two remainders with a gap" do
     create_price("pro", "30.00", ~D[2026-01-01], ~D[2027-01-01])
 
-    %{active_version("pro") | valid_at: {~D[2026-04-01], ~D[2026-07-01]}}
+    %{active_version("pro") | valid_at: range({~D[2026-04-01], ~D[2026-07-01]})}
     |> Ash.Changeset.for_destroy(:destroy)
     |> Ash.destroy!()
 
@@ -142,7 +239,7 @@ defmodule AshPostgres.ForPortionOfTest do
       })
       |> Ash.update!()
 
-    assert updated.valid_at == {~D[2023-12-31], ~D[2025-01-01]}
+    assert to_bounds(updated.valid_at) == {~D[2023-12-31], ~D[2025-01-01]}
     assert updated.monthly_price == Decimal.new("555.00")
 
     assert versions("pro") == [
@@ -171,7 +268,7 @@ defmodule AshPostgres.ForPortionOfTest do
     |> Ash.Query.sort(period: :asc)
     |> Ash.read!()
     |> Enum.map(fn booking ->
-      {lower, upper} = booking.period
+      {lower, upper} = to_bounds(booking.period)
       {to_second(lower), to_second(upper), booking.status}
     end)
   end
@@ -198,7 +295,7 @@ defmodule AshPostgres.ForPortionOfTest do
   test "tstzrange period: a plain destroy clips the booking, leaving the earlier portion" do
     create_booking("room-1", "tentative", ~U[2026-06-01 00:00:00Z], nil)
 
-    %{active_booking("room-1") | period: {~U[2026-06-16 00:00:00Z], nil}}
+    %{active_booking("room-1") | period: range({~U[2026-06-16 00:00:00Z], nil})}
     |> Ash.Changeset.for_destroy(:destroy)
     |> Ash.destroy!()
 

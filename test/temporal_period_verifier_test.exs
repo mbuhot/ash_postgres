@@ -226,6 +226,125 @@ defmodule AshPostgres.TemporalPeriodVerifierTest do
     assert error.message =~ "optimistic_lock"
   end
 
+  test "rejects an update action that accepts the period without require_atomic? false" do
+    error =
+      assert_dsl_error do
+        defmodule TpClipRequiresNonAtomic do
+          use Ash.Resource,
+            domain: nil,
+            validate_domain_inclusion?: false,
+            data_layer: AshPostgres.DataLayer
+
+          postgres do
+            table("tp_clip_requires_non_atomic")
+            repo(AshPostgres.TestRepo)
+            temporal_period(:valid_at)
+            migrate?(false)
+          end
+
+          actions do
+            defaults([:read])
+
+            update :change_price do
+              accept([:monthly_price, :valid_at])
+            end
+          end
+
+          attributes do
+            attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+            attribute(:valid_at, AshPostgres.Test.DateRange,
+              primary_key?: true,
+              allow_nil?: false,
+              public?: true
+            )
+
+            attribute(:monthly_price, :decimal, public?: true)
+          end
+        end
+      end
+
+    assert error.message =~ "require_atomic? false"
+    assert error.message =~ "FOR PORTION OF"
+  end
+
+  test "compiles when a period-accepting action sets require_atomic? false" do
+    refute_dsl_errors do
+      defmodule TpClipNonAtomic do
+        use Ash.Resource,
+          domain: nil,
+          validate_domain_inclusion?: false,
+          data_layer: AshPostgres.DataLayer
+
+        postgres do
+          table("tp_clip_non_atomic")
+          repo(AshPostgres.TestRepo)
+          temporal_period(:valid_at)
+          migrate?(false)
+        end
+
+        actions do
+          defaults([:read])
+
+          update :change_price do
+            accept([:monthly_price, :valid_at])
+            require_atomic?(false)
+          end
+        end
+
+        attributes do
+          attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+          attribute(:valid_at, AshPostgres.Test.DateRange,
+            primary_key?: true,
+            allow_nil?: false,
+            public?: true
+          )
+
+          attribute(:monthly_price, :decimal, public?: true)
+        end
+      end
+    end
+  end
+
+  test "an action that does not accept the period stays atomic-capable" do
+    refute_dsl_errors do
+      defmodule TpWholeRowAtomic do
+        use Ash.Resource,
+          domain: nil,
+          validate_domain_inclusion?: false,
+          data_layer: AshPostgres.DataLayer
+
+        postgres do
+          table("tp_whole_row_atomic")
+          repo(AshPostgres.TestRepo)
+          temporal_period(:valid_at)
+          migrate?(false)
+        end
+
+        actions do
+          defaults([:read])
+
+          update :set_price do
+            accept([:monthly_price])
+          end
+        end
+
+        attributes do
+          attribute(:code, :string, primary_key?: true, allow_nil?: false, public?: true)
+
+          attribute(:valid_at, AshPostgres.Test.DateRange,
+            primary_key?: true,
+            allow_nil?: false,
+            public?: true
+          )
+
+          attribute(:monthly_price, :decimal, public?: true)
+        end
+      end
+    end
+  end
+
   test "compiles when migrate? true and the repo installs btree_gist" do
     refute_dsl_errors do
       defmodule TpMigratableWithBtreeGist do

@@ -35,12 +35,27 @@ defmodule AshPostgres.ForPortionOfPolicyTest do
     |> Ash.create!(authorize?: false)
   end
 
+  defp to_bounds(%Postgrex.Range{lower: lower, upper: upper}),
+    do: {unbound_to_nil(lower), unbound_to_nil(upper)}
+
+  defp unbound_to_nil(:unbound), do: nil
+  defp unbound_to_nil(value), do: value
+
+  defp range({lower, upper}) do
+    %Postgrex.Range{
+      lower: lower || :unbound,
+      lower_inclusive: true,
+      upper: upper || :unbound,
+      upper_inclusive: false
+    }
+  end
+
   defp slices(owner, code) do
     GuardedRate
     |> Ash.Query.filter(code == ^code and owner == ^owner)
     |> Ash.Query.sort(valid_at: :asc)
     |> Ash.read!(authorize?: false)
-    |> Enum.map(&{&1.valid_at, &1.monthly_price})
+    |> Enum.map(&{to_bounds(&1.valid_at), &1.monthly_price})
   end
 
   test "forbidden row is not clipped: an update by a non-owning actor fails and leaves the row unchanged" do
@@ -113,7 +128,7 @@ defmodule AshPostgres.ForPortionOfPolicyTest do
       |> Ash.read_one!(authorize?: false)
 
     assert {:error, %Ash.Error.Forbidden{}} =
-             %{rate | valid_at: {~D[2026-06-16], nil}}
+             %{rate | valid_at: range({~D[2026-06-16], nil})}
              |> Ash.Changeset.for_destroy(:destroy, %{})
              |> Ash.destroy(actor: non_admin("acme"), authorize?: true)
 
@@ -128,7 +143,7 @@ defmodule AshPostgres.ForPortionOfPolicyTest do
       |> Ash.Query.filter(code == "pro" and owner == "acme")
       |> Ash.read_one!(authorize?: false)
 
-    %{rate | valid_at: {~D[2026-06-16], nil}}
+    %{rate | valid_at: range({~D[2026-06-16], nil})}
     |> Ash.Changeset.for_destroy(:destroy, %{})
     |> Ash.destroy!(actor: admin("acme"), authorize?: true)
 

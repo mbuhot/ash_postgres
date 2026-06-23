@@ -28,6 +28,7 @@ defmodule AshPostgres.Test.RoomBooking do
 
     update :rebook do
       accept [:status, :period]
+      require_atomic? false
     end
 
     destroy :destroy

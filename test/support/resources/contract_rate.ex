@@ -43,10 +43,12 @@ defmodule AshPostgres.Test.ContractRate do
 
     update :change_price do
       accept [:monthly_price, :valid_at]
+      require_atomic? false
     end
 
     update :change_active_price do
       accept [:monthly_price, :valid_at]
+      require_atomic? false
 
       change fn changeset, _ ->
         Ash.Changeset.filter(changeset, expr(active == true))
@@ -55,12 +57,15 @@ defmodule AshPostgres.Test.ContractRate do
 
     update :bump_version do
       accept [:monthly_price, :valid_at]
+      require_atomic? false
       change atomic_update(:version, expr(version + 1))
     end
 
     destroy :destroy
 
     destroy :destroy_active do
+      require_atomic? false
+
       change fn changeset, _ ->
         Ash.Changeset.filter(changeset, expr(active == true))
       end

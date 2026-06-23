@@ -52,6 +52,14 @@ defmodule AshPostgres.Verifiers.ValidateTemporalPeriod do
             "instead"
         )
 
+      atomic_clip_action = atomic_action_accepting_period(dsl, period) ->
+        error(
+          dsl,
+          "action `#{inspect(atomic_clip_action)}` accepts the temporal period " <>
+            "`#{inspect(period)}`, so it performs a `FOR PORTION OF` clip, which cannot run " <>
+            "atomically — set `require_atomic? false` on the action"
+        )
+
       true ->
         validate_btree_gist(dsl, period)
     end
@@ -76,6 +84,24 @@ defmodule AshPostgres.Verifiers.ValidateTemporalPeriod do
       action.changes,
       &match?(%Ash.Resource.Change{change: {Ash.Resource.Change.OptimisticLock, _}}, &1)
     )
+  end
+
+  # An update/destroy action whose (resolved) `accept` list includes the period attribute can
+  # change the period, which routes it through the `FOR PORTION OF` clip — a correlated,
+  # multi-row, non-atomic statement that Ash's atomic path cannot express. Such an action must
+  # opt out of atomic execution with `require_atomic? false`. Actions that do not accept the
+  # period only ever produce whole-row updates and stay atomic-capable. (Non-soft destroy
+  # actions always resolve to an empty `accept`, so they never trip this check.) Returns the
+  # name of the first offending action.
+  defp atomic_action_accepting_period(dsl, period) do
+    dsl
+    |> Verifier.get_entities([:actions])
+    |> Enum.filter(&(&1.type in [:update, :destroy]))
+    |> Enum.find(&(period in (&1.accept || []) and &1.require_atomic?))
+    |> case do
+      nil -> nil
+      action -> action.name
+    end
   end
 
   # The generated `WITHOUT OVERLAPS` primary key is backed by a GiST exclusion constraint,

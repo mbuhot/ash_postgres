@@ -34,12 +34,27 @@ defmodule AshPostgres.ForPortionOfFilterTest do
     |> Ash.create!()
   end
 
+  defp to_bounds(%Postgrex.Range{lower: lower, upper: upper}),
+    do: {unbound_to_nil(lower), unbound_to_nil(upper)}
+
+  defp unbound_to_nil(:unbound), do: nil
+  defp unbound_to_nil(value), do: value
+
+  defp range({lower, upper}) do
+    %Postgrex.Range{
+      lower: lower || :unbound,
+      lower_inclusive: true,
+      upper: upper || :unbound,
+      upper_inclusive: false
+    }
+  end
+
   defp versions(owner, code) do
     ContractRate
     |> Ash.Query.filter(code == ^code)
     |> Ash.Query.sort(valid_at: :asc)
     |> Ash.read!(tenant: owner)
-    |> Enum.map(&{&1.valid_at, &1.monthly_price})
+    |> Enum.map(&{to_bounds(&1.valid_at), &1.monthly_price})
   end
 
   defp slices(owner, code) do
@@ -47,7 +62,7 @@ defmodule AshPostgres.ForPortionOfFilterTest do
     |> Ash.Query.filter(code == ^code)
     |> Ash.Query.sort(valid_at: :asc)
     |> Ash.read!(tenant: owner)
-    |> Enum.map(&{&1.valid_at, &1.monthly_price, &1.version})
+    |> Enum.map(&{to_bounds(&1.valid_at), &1.monthly_price, &1.version})
   end
 
   test "an action filter excludes a non-matching row: the temporal update does NOT touch it" do
@@ -106,7 +121,7 @@ defmodule AshPostgres.ForPortionOfFilterTest do
       |> Ash.read_one!(tenant: "acme")
 
     assert {:error, %Ash.Error.Invalid{}} =
-             %{rate | valid_at: {~D[2026-06-16], nil}}
+             %{rate | valid_at: range({~D[2026-06-16], nil})}
              |> Ash.Changeset.for_destroy(:destroy_active, %{}, tenant: "acme")
              |> Ash.destroy()
 
@@ -190,7 +205,7 @@ defmodule AshPostgres.ForPortionOfFilterTest do
       |> Ash.Query.filter(code == "pro")
       |> Ash.read_one!(tenant: "acme")
 
-    nonexistent = %{rate | code: "ghost", valid_at: {~D[2026-06-16], nil}}
+    nonexistent = %{rate | code: "ghost", valid_at: range({~D[2026-06-16], nil})}
 
     assert {:error, %Ash.Error.Invalid{errors: errors}} =
              nonexistent
@@ -218,7 +233,7 @@ defmodule AshPostgres.ForPortionOfFilterTest do
       |> Ash.update!()
 
     assert updated.monthly_price == Decimal.new("60.00")
-    assert updated.valid_at == {~D[2026-06-16], nil}
+    assert to_bounds(updated.valid_at) == {~D[2026-06-16], nil}
     assert updated.code == "pro"
     assert updated.owner == "acme"
   end

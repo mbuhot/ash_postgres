@@ -6,8 +6,10 @@ defmodule AshPostgres.Test.TierPrice do
   @moduledoc """
   An application-time temporal resource: its composite primary key pairs an entity
   key (`code`) with a `daterange` period (`valid_at`, declared `WITHOUT OVERLAPS` in
-  the migration). Because a primary-key member's storage type is a range, ordinary
-  `update`/`destroy` actions are rewritten by the data layer to `FOR PORTION OF`.
+  the migration). An update/destroy that changes the period (`change_price` accepts
+  `valid_at`, `require_atomic? false`) is rewritten by the data layer to a
+  `FOR PORTION OF` clip; one that does not (`set_price` accepts only `monthly_price`)
+  is an ordinary whole-row atomic `UPDATE`.
   """
   use Ash.Resource,
     domain: AshPostgres.Test.Domain,
@@ -31,6 +33,11 @@ defmodule AshPostgres.Test.TierPrice do
 
     update :change_price do
       accept [:monthly_price, :valid_at]
+      require_atomic? false
+    end
+
+    update :set_price do
+      accept [:monthly_price]
     end
 
     destroy :destroy

@@ -55,6 +55,7 @@ defmodule AshPostgres.Test.GuardedRate do
 
     update :change_price do
       accept [:monthly_price, :valid_at]
+      require_atomic? false
     end
 
     destroy :destroy

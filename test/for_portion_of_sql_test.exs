@@ -17,9 +17,18 @@ defmodule AshPostgres.ForPortionOfSqlTest do
   alias AshPostgres.Test.TenantRate
   alias AshPostgres.Test.TierPrice
 
+  defp range({lower, upper}) do
+    %Postgrex.Range{
+      lower: lower || :unbound,
+      lower_inclusive: true,
+      upper: upper || :unbound,
+      upper_inclusive: false
+    }
+  end
+
   test "an empty filter produces no IN(subquery) clause" do
     changeset =
-      %TierPrice{code: "pro", valid_at: {~D[2026-01-01], nil}, monthly_price: Decimal.new("30.00")}
+      %TierPrice{code: "pro", valid_at: range({~D[2026-01-01], nil}), monthly_price: Decimal.new("30.00")}
       |> Map.update!(:__meta__, &Map.put(&1, :state, :loaded))
       |> Ash.Changeset.for_update(:change_price, %{
         monthly_price: Decimal.new("60.00"),
@@ -47,7 +56,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
       %ContractRate{
         owner: "acme",
         code: "pro",
-        valid_at: {~D[2026-01-01], nil},
+        valid_at: range({~D[2026-01-01], nil}),
         monthly_price: Decimal.new("30.00"),
         active: true,
         version: 1
@@ -80,7 +89,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
 
   test "source-mapped attributes emit storage column names in update SQL" do
     changeset =
-      %SourcedRate{code: "pro", valid_at: {~D[2026-01-01], nil}, monthly_price: Decimal.new("30.00")}
+      %SourcedRate{code: "pro", valid_at: range({~D[2026-01-01], nil}), monthly_price: Decimal.new("30.00")}
       |> Map.update!(:__meta__, &Map.put(&1, :state, :loaded))
       |> Ash.Changeset.for_update(:change_price, %{
         monthly_price: Decimal.new("60.00"),
@@ -106,7 +115,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
 
   test "source-mapped attributes emit storage columns in the (cols) IN(subquery) left side" do
     changeset =
-      %SourcedRate{code: "pro", valid_at: {~D[2026-01-01], nil}, monthly_price: Decimal.new("30.00")}
+      %SourcedRate{code: "pro", valid_at: range({~D[2026-01-01], nil}), monthly_price: Decimal.new("30.00")}
       |> Map.update!(:__meta__, &Map.put(&1, :state, :loaded))
       |> Ash.Changeset.for_update(:change_price, %{
         monthly_price: Decimal.new("60.00"),
@@ -127,7 +136,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
 
   test "source-mapped attributes emit storage column names in destroy SQL" do
     changeset =
-      %SourcedRate{code: "pro", valid_at: {~D[2026-01-01], nil}, monthly_price: Decimal.new("30.00")}
+      %SourcedRate{code: "pro", valid_at: range({~D[2026-01-01], nil}), monthly_price: Decimal.new("30.00")}
       |> Map.update!(:__meta__, &Map.put(&1, :state, :loaded))
       |> Ash.Changeset.for_destroy(:destroy, %{})
 
@@ -148,7 +157,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
 
   test "context multitenancy schema-qualifies the update target and its IN(subquery) to the tenant schema" do
     changeset =
-      %TenantRate{code: "pro", valid_at: {~D[2026-01-01], nil}, monthly_price: Decimal.new("30.00")}
+      %TenantRate{code: "pro", valid_at: range({~D[2026-01-01], nil}), monthly_price: Decimal.new("30.00")}
       |> Map.update!(:__meta__, &Map.put(&1, :state, :loaded))
       |> Ash.Changeset.for_update(
         :change_price,
@@ -171,7 +180,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
 
   test "context multitenancy schema-qualifies the destroy target and its IN(subquery) to the tenant schema" do
     changeset =
-      %TenantRate{code: "pro", valid_at: {~D[2026-01-01], nil}, monthly_price: Decimal.new("30.00")}
+      %TenantRate{code: "pro", valid_at: range({~D[2026-01-01], nil}), monthly_price: Decimal.new("30.00")}
       |> Map.update!(:__meta__, &Map.put(&1, :state, :loaded))
       |> Ash.Changeset.for_destroy(:destroy, %{}, tenant: "acme")
 

@@ -33,6 +33,7 @@ defmodule AshPostgres.Test.TenantRate do
 
     update :change_price do
       accept [:monthly_price, :valid_at]
+      require_atomic? false
     end
 
     destroy :destroy
