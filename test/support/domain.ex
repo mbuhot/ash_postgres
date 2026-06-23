@@ -14,6 +14,16 @@ defmodule AshPostgres.Test.Domain do
     end
 
     resource(AshPostgres.Test.Comedian)
+    resource(AshPostgres.Test.TierPrice)
+    resource(AshPostgres.Test.NonCanonicalTierPrice)
+    resource(AshPostgres.Test.RoomBooking)
+    resource(AshPostgres.Test.ContractRate)
+    resource(AshPostgres.Test.GuardedRate)
+    resource(AshPostgres.Test.OwnerGuardedRate)
+    resource(AshPostgres.Test.FragmentGuardedRate)
+    resource(AshPostgres.Test.SourcedRate)
+    resource(AshPostgres.Test.TenantRate)
+    resource(AshPostgres.Test.ExclWidget)
     resource(AshPostgres.Test.Comment)
     resource(AshPostgres.Test.CommentLink)
     resource(AshPostgres.Test.IntegerPost)

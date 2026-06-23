@@ -292,6 +292,26 @@ defmodule AshPostgres.DataLayer do
         doc:
           "Whether or not to include this resource in the generated migrations with `mix ash.generate_migrations`"
       ],
+      temporal_period: [
+        type: :atom,
+        default: nil,
+        doc: """
+        Marks this resource as an SQL:2011 application-time temporal table by naming the
+        range-typed primary-key attribute that holds its validity period (e.g. `:valid_at`).
+
+        When set, `update` and `destroy` actions are emitted as
+        `UPDATE/DELETE ... FOR PORTION OF <period>`: PostgreSQL clips the matching rows to
+        the written period and inserts any leftover remainder. The named attribute must be
+        part of the primary key (declared `WITHOUT OVERLAPS` in the table), its storage type
+        must be a range, and the key must have at least one other (entity-identifying) member.
+        Requires PostgreSQL 19+.
+
+        The named attribute's type must also materialize as a `%Postgrex.Range{}` at runtime:
+        its `cast_input`/`cast_stored` must yield a `%Postgrex.Range{}` (with `nil` or `:unbound`
+        for unbounded bounds). The verifier only checks the storage type, so a type that stores
+        as a range but casts to some other shape passes verification yet fails at runtime.
+        """
+      ],
       storage_types: [
         type: :keyword_list,
         default: [],
@@ -426,7 +446,8 @@ defmodule AshPostgres.DataLayer do
       AshPostgres.Verifiers.ValidateCheckConstraints,
       AshPostgres.Verifiers.PreventAttributeMultitenancyAndNonFullMatchType,
       AshPostgres.Verifiers.EnsureTableOrPolymorphic,
-      AshPostgres.Verifiers.ValidateIdentityIndexNames
+      AshPostgres.Verifiers.ValidateIdentityIndexNames,
+      AshPostgres.Verifiers.ValidateTemporalPeriod
     ]
 
   def migrate(args) do
@@ -677,16 +698,29 @@ defmodule AshPostgres.DataLayer do
 
   def can?(resource, :update_query) do
     # We can't currently support updating a record from a query
-    # if that record manages a tenant on update
+    # if that record manages a tenant on update.
+    #
+    # Temporal resources support the query path: a whole-row temporal update (the changeset
+    # leaves the period alone) is a plain atomic `UPDATE`. A period-changing clip is diverted
+    # inside `update_query/4` to the bespoke `FOR PORTION OF` statement.
     !AshPostgres.DataLayer.Info.manage_tenant_update?(resource)
   end
 
+  # Temporal resources support the query path. A single-record destroy carries the loaded
+  # snapshot in `changeset.data`, whose period is the asserted portion: `destroy_query/4`
+  # diverts it to a `FOR PORTION OF` statement, which uniformly handles a whole-row delete
+  # (the snapshot's full period) and a clip (a narrowed `valid_at`). A bulk/query destroy has
+  # no per-record snapshot (`changeset.data` is `OriginalDataNotAvailable`) and never clips —
+  # it falls through to a plain atomic `DELETE` of the whole rows matching the query.
   def can?(_, :destroy_query), do: true
 
   def can?(resource, :update_many) do
     # `update_many` is implemented with a single SQL MERGE, which (with RETURNING + merge_action)
     # requires PostgreSQL 17, and the same tenant-management restriction as `update_query`.
-    AshPostgres.DataLayer.Info.pg_version_matches?(resource, ">= 17.0.0") &&
+    # Temporal resources are excluded so bulk updates fall back to the per-record path, which
+    # emits `FOR PORTION OF`; a MERGE has no `FOR PORTION OF` and would apply wrong semantics.
+    is_nil(AshPostgres.DataLayer.Temporal.temporal_period_attribute(resource)) &&
+      AshPostgres.DataLayer.Info.pg_version_matches?(resource, ">= 17.0.0") &&
       !AshPostgres.DataLayer.Info.manage_tenant_update?(resource)
   end
 
@@ -1756,6 +1790,18 @@ defmodule AshPostgres.DataLayer do
 
   @impl true
   def update_query(query, changeset, resource, options) do
+    case AshPostgres.DataLayer.Temporal.temporal_clip_query_update(
+           query,
+           resource,
+           changeset,
+           options
+         ) do
+      :fallthrough -> do_update_query(query, changeset, resource, options)
+      result -> result
+    end
+  end
+
+  defp do_update_query(query, changeset, resource, options) do
     repo = AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
 
     ecto_changeset =
@@ -2076,6 +2122,13 @@ defmodule AshPostgres.DataLayer do
 
   @impl true
   def destroy_query(query, changeset, resource, options) do
+    case AshPostgres.DataLayer.Temporal.temporal_clip_query_destroy(resource, changeset, options) do
+      :fallthrough -> do_destroy_query(query, changeset, resource, options)
+      result -> result
+    end
+  end
+
+  defp do_destroy_query(query, changeset, resource, options) do
     repo = AshSql.dynamic_repo(resource, AshPostgres.SqlImplementation, changeset)
 
     ecto_changeset =
@@ -2235,6 +2288,29 @@ defmodule AshPostgres.DataLayer do
 
     source = resolve_source(resource, Enum.at(changesets, 0))
 
+    # A temporal resource's primary key is a `WITHOUT OVERLAPS` GiST exclusion constraint, so the
+    # standard upsert (`ON CONFLICT DO UPDATE`/`MERGE`) is impossible — Postgres rejects
+    # `ON CONFLICT` on an exclusion constraint. A temporal upsert means "assert these values for
+    # this period": we vacate the asserted period across the entity's overlapping rows with
+    # `DELETE ... FOR PORTION OF` (clipping neighbours, never touching disjoint periods), then
+    # INSERT the new period-row into the now-empty interval. This is dispatched before the
+    # `ON CONFLICT`/`MERGE` machinery below, which never runs for temporal resources.
+    if options[:upsert?] &&
+         not is_nil(AshPostgres.DataLayer.Temporal.temporal_period_attribute(resource)) do
+      AshPostgres.DataLayer.Temporal.temporal_upsert(
+        resource,
+        changesets,
+        source,
+        repo,
+        opts,
+        options
+      )
+    else
+      bulk_create_standard(resource, changesets, source, repo, opts, options)
+    end
+  end
+
+  defp bulk_create_standard(resource, changesets, source, repo, opts, options) do
     # On PostgreSQL 17+ we implement upserts with `MERGE` instead of `INSERT ... ON CONFLICT`,
     # which lets us report per-row whether each record was inserted or updated (via
     # `merge_action()`), surfaced as `:upsert_action` metadata. Below 17, when explicitly
@@ -2664,15 +2740,16 @@ defmodule AshPostgres.DataLayer do
     end)
   end
 
-  defp with_savepoint(
-         repo,
-         %{
-           __ash_bindings__: %{
-             expression_accumulator: %AshSql.Expr.ExprInfo{has_error?: true}
-           }
-         },
-         fun
-       ) do
+  @doc false
+  def with_savepoint(
+        repo,
+        %{
+          __ash_bindings__: %{
+            expression_accumulator: %AshSql.Expr.ExprInfo{has_error?: true}
+          }
+        },
+        fun
+      ) do
     if repo.in_transaction?() do
       savepoint_id = "a" <> (Ash.UUID.generate() |> String.replace("-", "_"))
 
@@ -2714,7 +2791,7 @@ defmodule AshPostgres.DataLayer do
     end
   end
 
-  defp with_savepoint(_repo, _acc, fun) do
+  def with_savepoint(_repo, _acc, fun) do
     fun.()
   end
 
@@ -3068,7 +3145,8 @@ defmodule AshPostgres.DataLayer do
     end
   end
 
-  defp maybe_update_tenant(resource, changeset, result) do
+  @doc false
+  def maybe_update_tenant(resource, changeset, result) do
     if AshPostgres.DataLayer.Info.manage_tenant_update?(resource) do
       changing_tenant_name? =
         resource
@@ -3106,7 +3184,8 @@ defmodule AshPostgres.DataLayer do
     end)
   end
 
-  defp ecto_changeset(record, changeset, type, repo, table_error?) do
+  @doc false
+  def ecto_changeset(record, changeset, type, repo, table_error?) do
     attributes =
       changeset.resource
       |> Ash.Resource.Info.attributes()
@@ -3150,12 +3229,13 @@ defmodule AshPostgres.DataLayer do
     end)
   end
 
-  defp handle_raised_error(
-         %Ecto.StaleEntryError{changeset: %{data: %resource{}, filters: filters}},
-         stacktrace,
-         context,
-         resource
-       ) do
+  @doc false
+  def handle_raised_error(
+        %Ecto.StaleEntryError{changeset: %{data: %resource{}, filters: filters}},
+        stacktrace,
+        context,
+        resource
+      ) do
     handle_raised_error(
       Ash.Error.Changes.StaleRecord.exception(resource: resource, filter: filters),
       stacktrace,
@@ -3164,17 +3244,17 @@ defmodule AshPostgres.DataLayer do
     )
   end
 
-  defp handle_raised_error(
-         %Postgrex.Error{
-           postgres: %{
-             code: :lock_not_available,
-             message: message
-           }
-         },
-         stacktrace,
-         context,
-         resource
-       ) do
+  def handle_raised_error(
+        %Postgrex.Error{
+          postgres: %{
+            code: :lock_not_available,
+            message: message
+          }
+        },
+        stacktrace,
+        context,
+        resource
+      ) do
     handle_raised_error(
       Ash.Error.Invalid.Unavailable.exception(
         resource: resource,
@@ -3187,18 +3267,18 @@ defmodule AshPostgres.DataLayer do
     )
   end
 
-  defp handle_raised_error(
-         %Postgrex.Error{
-           postgres: %{
-             code: :raise_exception,
-             message: "ash_error: \"" <> json,
-             severity: "ERROR"
-           }
-         },
-         _,
-         _,
-         _
-       ) do
+  def handle_raised_error(
+        %Postgrex.Error{
+          postgres: %{
+            code: :raise_exception,
+            message: "ash_error: \"" <> json,
+            severity: "ERROR"
+          }
+        },
+        _,
+        _,
+        _
+      ) do
     %{"exception" => exception, "input" => input} =
       json
       |> String.trim_trailing("\"")
@@ -3210,18 +3290,18 @@ defmodule AshPostgres.DataLayer do
     {:error, :no_rollback, Ash.Error.from_json(exception, input)}
   end
 
-  defp handle_raised_error(
-         %Postgrex.Error{
-           postgres: %{
-             code: :raise_exception,
-             message: "ash_error: " <> json,
-             severity: "ERROR"
-           }
-         },
-         _,
-         _,
-         _
-       ) do
+  def handle_raised_error(
+        %Postgrex.Error{
+          postgres: %{
+            code: :raise_exception,
+            message: "ash_error: " <> json,
+            severity: "ERROR"
+          }
+        },
+        _,
+        _,
+        _
+      ) do
     %{"exception" => exception, "input" => input} =
       Jason.decode!(json)
 
@@ -3230,15 +3310,18 @@ defmodule AshPostgres.DataLayer do
     {:error, :no_rollback, Ash.Error.from_json(exception, input)}
   end
 
-  defp handle_raised_error(
-         %Postgrex.Error{} = error,
-         stacktrace,
-         {:bulk_create, fake_changeset},
-         resource
-       ) do
+  def handle_raised_error(
+        %Postgrex.Error{} = error,
+        stacktrace,
+        {:bulk_create, fake_changeset},
+        resource
+      ) do
     case Ecto.Adapters.Postgres.Connection.to_constraints(error, []) do
       [] ->
-        {:error, Ash.Error.to_ash_error(error, stacktrace)}
+        case exclusion_violation_error(error, resource) do
+          nil -> {:error, Ash.Error.to_ash_error(error, stacktrace)}
+          exclusion_error -> {:error, Ash.Error.to_ash_error(exclusion_error)}
+        end
 
       constraints ->
         {:error,
@@ -3248,17 +3331,17 @@ defmodule AshPostgres.DataLayer do
     end
   end
 
-  defp handle_raised_error(
-         %Postgrex.Error{} = error,
-         stacktrace,
-         {:ecto_changeset, action, changeset},
-         resource
-       )
-       when action in [:insert, :update, :delete] do
+  def handle_raised_error(
+        %Postgrex.Error{} = error,
+        stacktrace,
+        {:ecto_changeset, action, changeset},
+        resource
+      )
+      when action in [:insert, :update, :delete] do
     handle_postgrex_error(error, stacktrace, changeset, resource, action)
   end
 
-  defp handle_raised_error(%Ecto.Query.CastError{} = e, stacktrace, context, resource) do
+  def handle_raised_error(%Ecto.Query.CastError{} = e, stacktrace, context, resource) do
     handle_raised_error(
       Ash.Error.Query.InvalidFilterValue.exception(value: e.value, context: context),
       stacktrace,
@@ -3267,16 +3350,16 @@ defmodule AshPostgres.DataLayer do
     )
   end
 
-  defp handle_raised_error(
-         %Postgrex.Error{} = error,
-         stacktrace,
-         changeset,
-         resource
-       ) do
+  def handle_raised_error(
+        %Postgrex.Error{} = error,
+        stacktrace,
+        changeset,
+        resource
+      ) do
     handle_postgrex_error(error, stacktrace, changeset, resource, :insert)
   end
 
-  defp handle_raised_error(error, stacktrace, _ecto_changeset, _resource) do
+  def handle_raised_error(error, stacktrace, _ecto_changeset, _resource) do
     {:error, Ash.Error.to_ash_error(error, stacktrace)}
   end
 
@@ -3285,13 +3368,18 @@ defmodule AshPostgres.DataLayer do
       [] ->
         constraints = maybe_foreign_key_violation_constraints(error)
 
-        if constraints != [] do
-          {:error,
-           changeset
-           |> constraints_to_errors(action, constraints, resource, error)
-           |> Ash.Error.to_ash_error()}
-        else
-          {:error, Ash.Error.to_ash_error(error, stacktrace)}
+        cond do
+          constraints != [] ->
+            {:error,
+             changeset
+             |> constraints_to_errors(action, constraints, resource, error)
+             |> Ash.Error.to_ash_error()}
+
+          exclusion_error = exclusion_violation_error(error, resource) ->
+            {:error, Ash.Error.to_ash_error(exclusion_error)}
+
+          true ->
+            {:error, Ash.Error.to_ash_error(error, stacktrace)}
         end
 
       constraints ->
@@ -3315,6 +3403,39 @@ defmodule AshPostgres.DataLayer do
   end
 
   defp maybe_foreign_key_violation_constraints(_), do: []
+
+  # Translates the GiST exclusion-constraint violation raised by a `WITHOUT OVERLAPS` temporal
+  # primary key (an ordinary `create` of a period overlapping an existing period-row) into a clean
+  # `Ash.Error.Changes.InvalidChanges` naming the period field, instead of letting it surface as
+  # `Ash.Error.Unknown` wrapping the raw `Postgrex.Error`.
+  #
+  # Scoped to temporal resources: a named exclusion violation reaches
+  # `Ecto.Adapters.Postgres.Connection.to_constraints/2` as `[exclusion: <name>]` and flows through
+  # `constraints_to_errors`, while an unnamed one falls to the `[]`-branch callers. In both, a
+  # non-temporal resource returns nil here so it keeps its prior error contract (an unconfigured
+  # exclusion constraint stays an `Ecto.ConstraintError`/`Ash.Error.Unknown`) — the temporal feature
+  # must not change the error shape for existing non-temporal users. Returns nil for non-exclusion
+  # errors so the caller falls back to its existing handling.
+  defp exclusion_violation_error(%Postgrex.Error{postgres: postgres}, resource)
+       when is_map(postgres) do
+    code = postgres[:code] || postgres["code"]
+    period = AshPostgres.DataLayer.Temporal.temporal_period_attribute(resource)
+
+    if code == :exclusion_violation and period do
+      constraint = postgres[:constraint] || postgres["constraint"]
+      detail = postgres[:detail] || postgres["detail"]
+
+      Ash.Error.Changes.InvalidChanges.exception(
+        fields: [period],
+        message: "conflicts with an existing #{period} period (overlapping period not allowed)",
+        validation: :exclusion,
+        value: detail,
+        vars: [constraint: constraint, constraint_type: :exclusion]
+      )
+    end
+  end
+
+  defp exclusion_violation_error(_, _), do: nil
 
   defp constraints_to_errors(
          %{constraints: user_constraints} = changeset,
@@ -3360,12 +3481,20 @@ defmodule AshPostgres.DataLayer do
           end)
 
         nil ->
-          Ecto.ConstraintError.exception(
-            action: action,
-            type: type,
-            constraint: constraint,
-            changeset: changeset
-          )
+          # An exclusion-constraint violation has no representable Ash attribute/identity to attach
+          # a check-constraint-style message to. For a temporal resource (a `WITHOUT OVERLAPS`
+          # primary key is a GiST exclusion constraint) translate it to a clean validation error;
+          # otherwise — including any non-exclusion constraint — fall back to `Ecto.ConstraintError`
+          # (which surfaces as `Ash.Error.Unknown`), preserving the prior error contract.
+          exclusion_error = if type == :exclusion, do: exclusion_violation_error(error, resource)
+
+          exclusion_error ||
+            Ecto.ConstraintError.exception(
+              action: action,
+              type: type,
+              constraint: constraint,
+              changeset: changeset
+            )
       end
     end)
   end
@@ -4012,6 +4141,13 @@ defmodule AshPostgres.DataLayer do
 
   @impl true
   def update(resource, changeset) do
+    case AshPostgres.DataLayer.Temporal.temporal_clip_period(resource, changeset) do
+      nil -> do_update(resource, changeset)
+      period -> AshPostgres.DataLayer.Temporal.for_portion_of_update(resource, changeset, period)
+    end
+  end
+
+  defp do_update(resource, changeset) do
     source = resolve_source(resource, changeset)
 
     query =
@@ -4081,7 +4217,14 @@ defmodule AshPostgres.DataLayer do
 
   @impl true
 
-  def destroy(resource, %{data: record} = changeset) do
+  def destroy(resource, changeset) do
+    case AshPostgres.DataLayer.Temporal.temporal_period_attribute(resource) do
+      nil -> do_destroy(resource, changeset)
+      period -> AshPostgres.DataLayer.Temporal.for_portion_of_destroy(resource, changeset, period)
+    end
+  end
+
+  defp do_destroy(resource, %{data: record} = changeset) do
     source = resolve_source(resource, changeset)
 
     query =
@@ -4482,7 +4625,8 @@ defmodule AshPostgres.DataLayer do
     AshPostgres.DataLayer.Info.repo(resource, :mutate).rollback(term)
   end
 
-  defp table(resource, changeset) do
+  @doc false
+  def table(resource, changeset) do
     changeset.context[:data_layer][:table] || AshPostgres.DataLayer.Info.table(resource)
   end
 
@@ -4501,7 +4645,8 @@ defmodule AshPostgres.DataLayer do
     end
   end
 
-  defp resolve_source(resource, changeset) do
+  @doc false
+  def resolve_source(resource, changeset) do
     if table = changeset.context[:data_layer][:table] do
       {table, resource}
     else
