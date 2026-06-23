@@ -256,7 +256,6 @@ defmodule AshPostgres.ForPortionOfFilterTest do
       |> Ash.update()
 
     assert {:error, %Ash.Error.Invalid{} = error} = result
-    refute match?(%Postgrex.Error{}, error)
     assert Exception.message(error) =~ "non-negative"
   end
 end
