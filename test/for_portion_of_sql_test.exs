@@ -36,7 +36,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
       })
 
     {statement, params, _columns} =
-      AshPostgres.DataLayer.build_for_portion_of_update(
+      AshPostgres.DataLayer.Temporal.build_for_portion_of_update(
         TierPrice,
         changeset,
         :valid_at,
@@ -70,7 +70,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
       |> Ash.Changeset.filter(Ash.Expr.expr(active == true))
 
     {statement, params, _columns} =
-      AshPostgres.DataLayer.build_for_portion_of_update(
+      AshPostgres.DataLayer.Temporal.build_for_portion_of_update(
         ContractRate,
         changeset,
         :valid_at,
@@ -97,7 +97,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
       })
 
     {statement, _params, _columns} =
-      AshPostgres.DataLayer.build_for_portion_of_update(
+      AshPostgres.DataLayer.Temporal.build_for_portion_of_update(
         SourcedRate,
         changeset,
         :valid_at,
@@ -124,7 +124,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
       |> Ash.Changeset.filter(Ash.Expr.expr(monthly_price == 30))
 
     {statement, _params, _columns} =
-      AshPostgres.DataLayer.build_for_portion_of_update(
+      AshPostgres.DataLayer.Temporal.build_for_portion_of_update(
         SourcedRate,
         changeset,
         :valid_at,
@@ -141,7 +141,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
       |> Ash.Changeset.for_destroy(:destroy, %{})
 
     {statement, _params} =
-      AshPostgres.DataLayer.build_for_portion_of_destroy(
+      AshPostgres.DataLayer.Temporal.build_for_portion_of_destroy(
         SourcedRate,
         changeset,
         :valid_at,
@@ -166,7 +166,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
       )
 
     {statement, _params, _columns} =
-      AshPostgres.DataLayer.build_for_portion_of_update(
+      AshPostgres.DataLayer.Temporal.build_for_portion_of_update(
         TenantRate,
         changeset,
         :valid_at,
@@ -185,7 +185,7 @@ defmodule AshPostgres.ForPortionOfSqlTest do
       |> Ash.Changeset.for_destroy(:destroy, %{}, tenant: "acme")
 
     {statement, _params} =
-      AshPostgres.DataLayer.build_for_portion_of_destroy(
+      AshPostgres.DataLayer.Temporal.build_for_portion_of_destroy(
         TenantRate,
         changeset,
         :valid_at,
