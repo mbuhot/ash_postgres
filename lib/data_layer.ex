@@ -3580,38 +3580,30 @@ defmodule AshPostgres.DataLayer do
 
   defp maybe_foreign_key_violation_constraints(_), do: []
 
-  # Translates a PostgreSQL exclusion-constraint violation (SQLSTATE 23P01) into a clean
-  # `Ash.Error.Changes.InvalidChanges` instead of letting it surface as `Ash.Error.Unknown`
-  # wrapping the raw `Postgrex.Error`. Ecto does not model exclusion constraints, so these
-  # never appear in `Ecto.Adapters.Postgres.Connection.to_constraints/2` and always reach the
-  # untranslated fallthrough.
+  # Translates the GiST exclusion-constraint violation raised by a `WITHOUT OVERLAPS` temporal
+  # primary key (an ordinary `create` of a period overlapping an existing period-row) into a clean
+  # `Ash.Error.Changes.InvalidChanges` naming the period field, instead of letting it surface as
+  # `Ash.Error.Unknown` wrapping the raw `Postgrex.Error`.
   #
-  # A `WITHOUT OVERLAPS` temporal primary key is itself a GiST exclusion constraint, so an
-  # ordinary `create` of a period overlapping an existing period-row raises this. When the
-  # resource is temporal, the message names the period field; otherwise it stays general so any
-  # exclusion constraint (the kind a `pg_extension`/`reference`/custom GiST exclusion declares)
-  # is reported sensibly rather than as an opaque error. Returns nil for non-exclusion errors so
-  # the caller falls back to its existing handling.
+  # Scoped to temporal resources: a named exclusion violation reaches
+  # `Ecto.Adapters.Postgres.Connection.to_constraints/2` as `[exclusion: <name>]` and flows through
+  # `constraints_to_errors`, while an unnamed one falls to the `[]`-branch callers. In both, a
+  # non-temporal resource returns nil here so it keeps its prior error contract (an unconfigured
+  # exclusion constraint stays an `Ecto.ConstraintError`/`Ash.Error.Unknown`) — the temporal feature
+  # must not change the error shape for existing non-temporal users. Returns nil for non-exclusion
+  # errors so the caller falls back to its existing handling.
   defp exclusion_violation_error(%Postgrex.Error{postgres: postgres}, resource)
        when is_map(postgres) do
     code = postgres[:code] || postgres["code"]
+    period = temporal_period_attribute(resource)
 
-    if code in ["23P01", :exclusion_violation] do
+    if code == :exclusion_violation and period do
       constraint = postgres[:constraint] || postgres["constraint"]
       detail = postgres[:detail] || postgres["detail"]
-      period = temporal_period_attribute(resource)
-
-      {fields, message} =
-        if period do
-          {[period],
-           "conflicts with an existing #{period} period (overlapping period not allowed)"}
-        else
-          {[], "conflicts with an existing record (exclusion constraint violated)"}
-        end
 
       Ash.Error.Changes.InvalidChanges.exception(
-        fields: fields,
-        message: message,
+        fields: [period],
+        message: "conflicts with an existing #{period} period (overlapping period not allowed)",
         validation: :exclusion,
         value: detail,
         vars: [constraint: constraint, constraint_type: :exclusion]
@@ -3665,20 +3657,20 @@ defmodule AshPostgres.DataLayer do
           end)
 
         nil ->
-          # An exclusion-constraint violation (e.g. a `WITHOUT OVERLAPS` temporal primary key,
-          # which is a GiST exclusion constraint) has no representable Ash attribute/identity to
-          # attach a check-constraint-style message to. Translate it to a clean validation error
-          # instead of an opaque `Ecto.ConstraintError` (which surfaces as `Ash.Error.Unknown`).
-          if type == :exclusion do
-            exclusion_violation_error(error, resource)
-          else
+          # An exclusion-constraint violation has no representable Ash attribute/identity to attach
+          # a check-constraint-style message to. For a temporal resource (a `WITHOUT OVERLAPS`
+          # primary key is a GiST exclusion constraint) translate it to a clean validation error;
+          # otherwise — including any non-exclusion constraint — fall back to `Ecto.ConstraintError`
+          # (which surfaces as `Ash.Error.Unknown`), preserving the prior error contract.
+          exclusion_error = if type == :exclusion, do: exclusion_violation_error(error, resource)
+
+          exclusion_error ||
             Ecto.ConstraintError.exception(
               action: action,
               type: type,
               constraint: constraint,
               changeset: changeset
             )
-          end
       end
     end)
   end

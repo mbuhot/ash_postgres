@@ -21,6 +21,7 @@ defmodule AshPostgres.Test.Domain do
     resource(AshPostgres.Test.GuardedRate)
     resource(AshPostgres.Test.SourcedRate)
     resource(AshPostgres.Test.TenantRate)
+    resource(AshPostgres.Test.ExclWidget)
     resource(AshPostgres.Test.Comment)
     resource(AshPostgres.Test.CommentLink)
     resource(AshPostgres.Test.IntegerPost)
