@@ -4437,7 +4437,7 @@ defmodule AshPostgres.DataLayer do
 
     case run_for_portion_of(repo, changeset, resource, :update, statement, params) do
       {:ok, result} ->
-        case as_of_from_slice(load_returned_records(resource, columns, result), period) do
+        case as_of_from_slice(load_returned_records(resource, changeset, columns, result), period) do
           nil ->
             {:error,
              Ash.Error.Changes.StaleRecord.exception(
@@ -4471,7 +4471,7 @@ defmodule AshPostgres.DataLayer do
 
     case run_for_portion_of(repo, changeset, resource, :update, statement, params) do
       {:ok, result} ->
-        {:ok, load_returned_records(resource, columns, result)}
+        {:ok, load_returned_records(resource, changeset, columns, result)}
 
       {:error, error} ->
         {:error, error}
@@ -4707,7 +4707,7 @@ defmodule AshPostgres.DataLayer do
   defp empty_filter?(_), do: false
 
   # Returns the `RETURNING` SQL (storage column names) alongside the attribute names in the
-  # same order, so `load_returned_records/3` can zip each returned value back to its attribute.
+  # same order, so `load_returned_records/4` can zip each returned value back to its attribute.
   defp returning_clause(resource) do
     attributes =
       resource
@@ -4767,7 +4767,7 @@ defmodule AshPostgres.DataLayer do
   defp compare_lower(lower, other) when lower > other, do: :gt
   defp compare_lower(_lower, _other), do: :eq
 
-  defp load_returned_records(resource, columns, %{rows: rows}) do
+  defp load_returned_records(resource, changeset, columns, %{rows: rows}) do
     Enum.map(rows, fn row ->
       attrs =
         columns
@@ -4782,7 +4782,8 @@ defmodule AshPostgres.DataLayer do
       |> struct(attrs)
       |> Map.put(:__meta__, %Ecto.Schema.Metadata{
         state: :loaded,
-        source: AshPostgres.DataLayer.Info.table(resource)
+        source: table(resource, changeset),
+        prefix: table_schema(resource, changeset)
       })
     end)
   end
