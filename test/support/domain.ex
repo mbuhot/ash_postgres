@@ -19,6 +19,8 @@ defmodule AshPostgres.Test.Domain do
     resource(AshPostgres.Test.RoomBooking)
     resource(AshPostgres.Test.ContractRate)
     resource(AshPostgres.Test.GuardedRate)
+    resource(AshPostgres.Test.OwnerGuardedRate)
+    resource(AshPostgres.Test.FragmentGuardedRate)
     resource(AshPostgres.Test.SourcedRate)
     resource(AshPostgres.Test.TenantRate)
     resource(AshPostgres.Test.ExclWidget)
