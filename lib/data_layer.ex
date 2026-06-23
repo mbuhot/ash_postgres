@@ -304,7 +304,7 @@ defmodule AshPostgres.DataLayer do
         the written period and inserts any leftover remainder. The named attribute must be
         part of the primary key (declared `WITHOUT OVERLAPS` in the table), its storage type
         must be a range, and the key must have at least one other (entity-identifying) member.
-        Requires PostgreSQL 18+.
+        Requires PostgreSQL 19+.
         """
       ],
       storage_types: [
@@ -2636,6 +2636,10 @@ defmodule AshPostgres.DataLayer do
   # not reported (the merge has no single matched row); the inserted period-rows are returned
   # plainly.
   defp temporal_upsert(resource, changesets, source, repo, opts, options) do
+    unless for_portion_of_supported?(repo) do
+      raise for_portion_of_unsupported_error(repo)
+    end
+
     period = temporal_period_attribute(resource)
 
     returning =
@@ -4579,11 +4583,40 @@ defmodule AshPostgres.DataLayer do
     {statement, params}
   end
 
+  # `UPDATE/DELETE ... FOR PORTION OF` is a PostgreSQL 19 feature (PG18 only adds the
+  # `WITHOUT OVERLAPS` DDL). The temporal resources compile on any version, so support is
+  # decided at runtime from the repo's declared `min_pg_version`, mirroring how `repo.ex`
+  # branches on the major version for the builtin uuidv7 function.
+  defp for_portion_of_supported?(repo) do
+    %Version{major: major} = repo.min_pg_version()
+    major >= 19
+  end
+
+  # Builds the clear `Ash.Error` raised/returned when a `FOR PORTION OF` mutation is attempted
+  # on a repo declaring a PostgreSQL version below 19, naming the requirement and the declared
+  # version instead of leaking a raw `Postgrex.Error` syntax failure from the server.
+  defp for_portion_of_unsupported_error(repo) do
+    declared = repo.min_pg_version()
+
+    Ash.Error.to_ash_error(
+      "FOR PORTION OF temporal mutations require PostgreSQL 19, but #{inspect(repo)} declares " <>
+        "min_pg_version #{Version.to_string(declared)}. Upgrade the database to PostgreSQL >= 19."
+    )
+  end
+
   # Runs the hand-built FOR PORTION OF statement inside the same savepoint and error
   # translation the normal mutation paths use, so a WITHOUT OVERLAPS exclusion (or any
   # FK/check/not-null violation) surfaces as a translated `Ash.Error` rather than a raw
   # `Postgrex.Error`, and failure is savepoint-isolated.
   defp run_for_portion_of(repo, changeset, resource, action, statement, params) do
+    if for_portion_of_supported?(repo) do
+      do_run_for_portion_of(repo, changeset, resource, action, statement, params)
+    else
+      {:error, for_portion_of_unsupported_error(repo)}
+    end
+  end
+
+  defp do_run_for_portion_of(repo, changeset, resource, action, statement, params) do
     ecto_changeset =
       case changeset.data do
         %Ash.Changeset.OriginalDataNotAvailable{} -> changeset.resource.__struct__()
