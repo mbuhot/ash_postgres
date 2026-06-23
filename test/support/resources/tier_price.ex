@@ -31,6 +31,11 @@ defmodule AshPostgres.Test.TierPrice do
       accept [:code, :valid_at, :monthly_price]
     end
 
+    create :upsert_price do
+      accept [:code, :valid_at, :monthly_price]
+      upsert? true
+    end
+
     update :change_price do
       accept [:monthly_price, :valid_at]
       require_atomic? false

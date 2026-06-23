@@ -2341,6 +2341,21 @@ defmodule AshPostgres.DataLayer do
 
     source = resolve_source(resource, Enum.at(changesets, 0))
 
+    # A temporal resource's primary key is a `WITHOUT OVERLAPS` GiST exclusion constraint, so the
+    # standard upsert (`ON CONFLICT DO UPDATE`/`MERGE`) is impossible — Postgres rejects
+    # `ON CONFLICT` on an exclusion constraint. A temporal upsert means "assert these values for
+    # this period": we vacate the asserted period across the entity's overlapping rows with
+    # `DELETE ... FOR PORTION OF` (clipping neighbours, never touching disjoint periods), then
+    # INSERT the new period-row into the now-empty interval. This is dispatched before the
+    # `ON CONFLICT`/`MERGE` machinery below, which never runs for temporal resources.
+    if options[:upsert?] && not is_nil(temporal_period_attribute(resource)) do
+      temporal_upsert(resource, changesets, source, repo, opts, options)
+    else
+      bulk_create_standard(resource, changesets, source, repo, opts, options)
+    end
+  end
+
+  defp bulk_create_standard(resource, changesets, source, repo, opts, options) do
     # On PostgreSQL 17+ we implement upserts with `MERGE` instead of `INSERT ... ON CONFLICT`,
     # which lets us report per-row whether each record was inserted or updated (via
     # `merge_action()`), surfaced as `:upsert_action` metadata. Below 17, when explicitly
@@ -2606,6 +2621,128 @@ defmodule AshPostgres.DataLayer do
           resource
         )
     end
+  end
+
+  # Performs a temporal upsert: "assert these values for this period". For each changeset
+  # (a period-row), within one savepoint, we first vacate the asserted period across the
+  # entity's overlapping rows (`DELETE ... FOR PORTION OF`), then INSERT the new row into the
+  # now-vacated interval. The asserted period therefore ends up holding exactly the new row's
+  # values, neighbouring periods are clipped at its boundaries, and gaps are filled. The whole
+  # batch is atomic (all-or-nothing) and errors translate through `handle_raised_error`.
+  #
+  # `upsert_fields`/conflict-field semantics do not apply: the asserted period is wholly replaced
+  # by the new row, so a partial column merge is meaningless here. If `upsert_fields` is set it is
+  # ignored for temporal upserts. Per-row insert-vs-update `:upsert_action` metadata is likewise
+  # not reported (the merge has no single matched row); the inserted period-rows are returned
+  # plainly.
+  defp temporal_upsert(resource, changesets, source, repo, opts, options) do
+    period = temporal_period_attribute(resource)
+
+    returning =
+      if options.return_records? do
+        resource
+        |> Ash.Resource.Info.attributes()
+        |> Enum.map(& &1.name)
+      else
+        nil
+      end
+
+    savepoint_query = %{
+      __ash_bindings__: %{
+        expression_accumulator: %AshSql.Expr.ExprInfo{has_error?: true}
+      }
+    }
+
+    try do
+      results =
+        with_savepoint(repo, savepoint_query, fn ->
+          Enum.map(changesets, fn changeset ->
+            temporal_upsert_one(resource, changeset, period, source, repo, opts, returning)
+          end)
+        end)
+
+      if options.return_records? do
+        {:ok, Enum.map(results, fn {record, changeset} -> tag_bulk_ref(record, changeset) end)}
+      else
+        :ok
+      end
+    rescue
+      e ->
+        changeset = Enum.at(changesets, 0)
+
+        ecto_changeset =
+          changeset.data
+          |> case do
+            %Ash.Changeset.OriginalDataNotAvailable{} -> changeset.resource.__struct__()
+            data -> data
+          end
+          |> Map.update!(:__meta__, &Map.put(&1, :source, table(resource, changeset)))
+          |> ecto_changeset(changeset, :create, repo, true)
+
+        handle_raised_error(
+          e,
+          __STACKTRACE__,
+          {:ecto_changeset, :insert, ecto_changeset},
+          resource
+        )
+    end
+  end
+
+  # Vacates the changeset's asserted period across the entity's overlapping rows, then inserts
+  # the new period-row. The DELETE's portion is the changeset's period value; its WHERE is the
+  # entity key (primary key minus the period), all sourced from `changeset.attributes` (a create
+  # changeset has no `changeset.data`). Tenant scoping is honoured the same way the update/destroy
+  # `FOR PORTION OF` paths do: the table is schema-qualified for `:context` multitenancy, and the
+  # INSERT carries the tenant schema as its prefix.
+  defp temporal_upsert_one(resource, changeset, period, source, repo, opts, returning) do
+    {vacate_sql, vacate_params} = build_temporal_vacate(resource, changeset, period)
+    repo.query!(vacate_sql, vacate_params)
+
+    insert_opts =
+      if schema = changeset.context[:data_layer][:schema] do
+        Keyword.put(opts, :prefix, schema)
+      else
+        opts
+      end
+
+    insert_opts =
+      case returning do
+        nil -> insert_opts
+        fields -> Keyword.put(insert_opts, :returning, fields)
+      end
+
+    {_count, inserted} = repo.insert_all(source, [changeset.attributes], insert_opts)
+
+    record =
+      case inserted do
+        [record | _] -> record
+        _ -> nil
+      end
+
+    {record, changeset}
+  end
+
+  # Builds `DELETE FROM <table> FOR PORTION OF <period> FROM .. TO .. WHERE <entity key>` for a
+  # temporal upsert, reading the asserted period and entity-key values from `changeset.attributes`
+  # (a create changeset carries its values there, not in `changeset.data`).
+  defp build_temporal_vacate(resource, changeset, period) do
+    {portion_sql, params} =
+      period_bounds(Map.fetch!(changeset.attributes, period), subtype(resource, period), [])
+
+    {where_sql, params} =
+      identity_clause(resource, changeset.attributes, period, nil, params)
+
+    statement =
+      "DELETE FROM #{qualified_table(resource, changeset)} FOR PORTION OF #{quote_identifier(storage_name(resource, period))} #{portion_sql} " <>
+        "WHERE #{where_sql}"
+
+    {statement, params}
+  end
+
+  defp tag_bulk_ref(nil, _changeset), do: nil
+
+  defp tag_bulk_ref(record, changeset) do
+    Ash.Resource.put_metadata(record, :bulk_action_ref, changeset.context[:bulk_create][:ref])
   end
 
   @impl true
@@ -3344,7 +3481,10 @@ defmodule AshPostgres.DataLayer do
        ) do
     case Ecto.Adapters.Postgres.Connection.to_constraints(error, []) do
       [] ->
-        {:error, Ash.Error.to_ash_error(error, stacktrace)}
+        case exclusion_violation_error(error, resource) do
+          nil -> {:error, Ash.Error.to_ash_error(error, stacktrace)}
+          exclusion_error -> {:error, Ash.Error.to_ash_error(exclusion_error)}
+        end
 
       constraints ->
         {:error,
@@ -3391,13 +3531,18 @@ defmodule AshPostgres.DataLayer do
       [] ->
         constraints = maybe_foreign_key_violation_constraints(error)
 
-        if constraints != [] do
-          {:error,
-           changeset
-           |> constraints_to_errors(action, constraints, resource, error)
-           |> Ash.Error.to_ash_error()}
-        else
-          {:error, Ash.Error.to_ash_error(error, stacktrace)}
+        cond do
+          constraints != [] ->
+            {:error,
+             changeset
+             |> constraints_to_errors(action, constraints, resource, error)
+             |> Ash.Error.to_ash_error()}
+
+          exclusion_error = exclusion_violation_error(error, resource) ->
+            {:error, Ash.Error.to_ash_error(exclusion_error)}
+
+          true ->
+            {:error, Ash.Error.to_ash_error(error, stacktrace)}
         end
 
       constraints ->
@@ -3421,6 +3566,47 @@ defmodule AshPostgres.DataLayer do
   end
 
   defp maybe_foreign_key_violation_constraints(_), do: []
+
+  # Translates a PostgreSQL exclusion-constraint violation (SQLSTATE 23P01) into a clean
+  # `Ash.Error.Changes.InvalidChanges` instead of letting it surface as `Ash.Error.Unknown`
+  # wrapping the raw `Postgrex.Error`. Ecto does not model exclusion constraints, so these
+  # never appear in `Ecto.Adapters.Postgres.Connection.to_constraints/2` and always reach the
+  # untranslated fallthrough.
+  #
+  # A `WITHOUT OVERLAPS` temporal primary key is itself a GiST exclusion constraint, so an
+  # ordinary `create` of a period overlapping an existing period-row raises this. When the
+  # resource is temporal, the message names the period field; otherwise it stays general so any
+  # exclusion constraint (the kind a `pg_extension`/`reference`/custom GiST exclusion declares)
+  # is reported sensibly rather than as an opaque error. Returns nil for non-exclusion errors so
+  # the caller falls back to its existing handling.
+  defp exclusion_violation_error(%Postgrex.Error{postgres: postgres}, resource)
+       when is_map(postgres) do
+    code = postgres[:code] || postgres["code"]
+
+    if code in ["23P01", :exclusion_violation] do
+      constraint = postgres[:constraint] || postgres["constraint"]
+      detail = postgres[:detail] || postgres["detail"]
+      period = temporal_period_attribute(resource)
+
+      {fields, message} =
+        if period do
+          {[period],
+           "conflicts with an existing #{period} period (overlapping period not allowed)"}
+        else
+          {[], "conflicts with an existing record (exclusion constraint violated)"}
+        end
+
+      Ash.Error.Changes.InvalidChanges.exception(
+        fields: fields,
+        message: message,
+        validation: :exclusion,
+        value: detail,
+        vars: [constraint: constraint, constraint_type: :exclusion]
+      )
+    end
+  end
+
+  defp exclusion_violation_error(_, _), do: nil
 
   defp constraints_to_errors(
          %{constraints: user_constraints} = changeset,
@@ -3466,12 +3652,20 @@ defmodule AshPostgres.DataLayer do
           end)
 
         nil ->
-          Ecto.ConstraintError.exception(
-            action: action,
-            type: type,
-            constraint: constraint,
-            changeset: changeset
-          )
+          # An exclusion-constraint violation (e.g. a `WITHOUT OVERLAPS` temporal primary key,
+          # which is a GiST exclusion constraint) has no representable Ash attribute/identity to
+          # attach a check-constraint-style message to. Translate it to a clean validation error
+          # instead of an opaque `Ecto.ConstraintError` (which surfaces as `Ash.Error.Unknown`).
+          if type == :exclusion do
+            exclusion_violation_error(error, resource)
+          else
+            Ecto.ConstraintError.exception(
+              action: action,
+              type: type,
+              constraint: constraint,
+              changeset: changeset
+            )
+          end
       end
     end)
   end
