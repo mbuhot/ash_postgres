@@ -15,6 +15,7 @@ defmodule AshPostgres.Test.Domain do
 
     resource(AshPostgres.Test.Comedian)
     resource(AshPostgres.Test.TierPrice)
+    resource(AshPostgres.Test.NonCanonicalTierPrice)
     resource(AshPostgres.Test.RoomBooking)
     resource(AshPostgres.Test.ContractRate)
     resource(AshPostgres.Test.GuardedRate)

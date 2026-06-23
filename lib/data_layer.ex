@@ -305,6 +305,11 @@ defmodule AshPostgres.DataLayer do
         part of the primary key (declared `WITHOUT OVERLAPS` in the table), its storage type
         must be a range, and the key must have at least one other (entity-identifying) member.
         Requires PostgreSQL 19+.
+
+        The named attribute's type must also materialize as a `%Postgrex.Range{}` at runtime:
+        its `cast_input`/`cast_stored` must yield a `%Postgrex.Range{}` (with `nil` or `:unbound`
+        for unbounded bounds). The verifier only checks the storage type, so a type that stores
+        as a range but casts to some other shape passes verification yet fails at runtime.
         """
       ],
       storage_types: [
@@ -4733,6 +4738,18 @@ defmodule AshPostgres.DataLayer do
   end
 
   defp period_lower(%Postgrex.Range{lower: lower}), do: unbound_to_nil(lower)
+  defp period_lower(value), do: raise(non_range_period_error(value))
+
+  # A temporal period attribute must materialize as a `%Postgrex.Range{}` at runtime, but the
+  # compile-time verifier only checks the storage type. Surface a violation of that contract as a
+  # clear `Ash.Error` instead of letting a `FunctionClauseError` escape.
+  defp non_range_period_error(value) do
+    Ash.Error.to_ash_error(
+      "Temporal period value #{inspect(value)} is not a %Postgrex.Range{}. A temporal_period " <>
+        "attribute's type must cast and materialize to a %Postgrex.Range{} (with nil or :unbound " <>
+        "for unbounded bounds) after cast_input/cast_stored."
+    )
+  end
 
   defp unbound_to_nil(:unbound), do: nil
   defp unbound_to_nil(value), do: value
@@ -4821,6 +4838,8 @@ defmodule AshPostgres.DataLayer do
       _ -> {"#{from_sql} TO $#{length(params) + 1}::#{subtype}", params ++ [upper]}
     end
   end
+
+  defp period_bounds(value, _subtype, _params), do: raise(non_range_period_error(value))
 
   # Renders the SET clause — static attribute changes and `changeset.atomics` (e.g. an
   # `atomic_update`/counter expression) together — by reusing `AshSql.Atomics.query_with_atomics`,
