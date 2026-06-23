@@ -26,6 +26,26 @@ defmodule AshPostgres.DataLayer.Temporal do
   # The portion bounds come from the period attribute's value on the changeset (the change for
   # updates, the record for destroys); the SET clause is the other attribute changes; the WHERE
   # clause is the rest of the primary key (the entity key).
+  #
+  # === Performance characteristics (issue #31; documented, deferred) ======================
+  #
+  # Two known costs are deliberately accepted here rather than reworked; an index-usable rewrite
+  # is deferred pending benchmarking, and the full-PK correlation below is kept for correctness.
+  #
+  # 1. The streamed per-record path (`update/2` / `destroy/2`, reached when an action runs
+  #    `require_atomic? false` per-record) emits one `UPDATE/DELETE ... FOR PORTION OF` statement
+  #    per matching row: N statements, N savepoints, N round-trips — not a single set-based op.
+  #    Only the `for_portion_of_bulk_update` membership-clause route (the `Ash.bulk_update` query
+  #    path) runs the clip as one statement covering every matched row.
+  #
+  # 2. The full-PK `(pk) IN (<subquery>)` correlation (`bulk_membership_clause/3`,
+  #    `filter_subquery/4`) compares the range/period column by equality (`=`). The temporal
+  #    `WITHOUT OVERLAPS` primary key is backed by a GiST exclusion index built for the overlap
+  #    operator (`&&`), not range `=`, so this IN-subquery — evaluated once per mutation — can
+  #    fall back to a sequential scan on a large timeline. The full-PK correlation is a deliberate
+  #    correctness choice (a sibling period-row must not authorize a clip of a different row); an
+  #    index-usable rewrite (entity-key `=` plus period `&&` overlap) is deferred pending
+  #    benchmarking.
 
   @doc false
   def temporal_period_attribute(resource) do
